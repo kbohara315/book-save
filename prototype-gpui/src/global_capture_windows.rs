@@ -13,6 +13,7 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{GetLastError, GlobalFree, HGLOBAL, HWND, LPARAM, LRESULT, SetLastError, WPARAM},
+    Graphics::Gdi::{BITMAP, DeleteObject, GetObjectW, HBITMAP},
     System::{
         DataExchange::*,
         LibraryLoader::GetModuleHandleW,
@@ -281,40 +282,81 @@ impl Drop for Clipboard {
     }
 }
 
-struct ClipboardData(HGLOBAL);
+enum ClipboardData {
+    Global(HGLOBAL),
+    Bitmap(HBITMAP),
+}
 
 impl ClipboardData {
     fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let data = Self(unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) });
-        if data.0.is_null() {
+        let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) };
+        if handle.is_null() {
             return Err("Cannot allocate a safe clipboard backup.".into());
         }
-        let target = unsafe { GlobalLock(data.0) };
+        let target = unsafe { GlobalLock(handle) };
         if target.is_null() {
+            unsafe {
+                GlobalFree(handle);
+            }
             return Err("Cannot lock the clipboard backup.".into());
         }
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), target.cast(), bytes.len());
-            GlobalUnlock(data.0);
+            GlobalUnlock(handle);
         }
-        Ok(data)
+        Ok(Self::Global(handle))
     }
 
-    fn put(mut self, format: u32) -> Result<(), String> {
-        if unsafe { SetClipboardData(format, self.0) }.is_null() {
+    fn from_bitmap(handle: HBITMAP) -> Result<Self, String> {
+        let mut bitmap = BITMAP::default();
+        if unsafe {
+            GetObjectW(
+                handle,
+                size_of::<BITMAP>() as i32,
+                (&mut bitmap as *mut BITMAP).cast(),
+            )
+        } != size_of::<BITMAP>() as i32
+        {
+            return Err("Cannot inspect the clipboard bitmap safely.".into());
+        }
+        let byte_size = i64::from(bitmap.bmWidthBytes)
+            .checked_abs()
+            .and_then(|row| row.checked_mul(i64::from(bitmap.bmHeight).checked_abs()?));
+        if !byte_size.is_some_and(|size| size > 0 && size <= 16 * 1024 * 1024) {
+            return Err(
+                "Clipboard bitmap is empty, too large, or cannot be backed up safely.".into(),
+            );
+        }
+        let copy = unsafe { CopyImage(handle, IMAGE_BITMAP, 0, 0, 0) };
+        if copy.is_null() {
+            return Err("Cannot copy the clipboard bitmap safely.".into());
+        }
+        Ok(Self::Bitmap(copy.cast()))
+    }
+
+    fn put(self, format: u32) -> Result<(), String> {
+        let handle = match &self {
+            Self::Global(handle) => *handle,
+            Self::Bitmap(handle) => *handle,
+        };
+        if unsafe { SetClipboardData(format, handle) }.is_null() {
             return Err("Cannot restore clipboard data.".into());
         }
-        self.0 = null_mut();
+        std::mem::forget(self);
         Ok(())
     }
 }
 
 impl Drop for ClipboardData {
     fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                GlobalFree(self.0);
-            }
+        match self {
+            Self::Global(handle) if !handle.is_null() => unsafe {
+                GlobalFree(*handle);
+            },
+            Self::Bitmap(handle) if !handle.is_null() => unsafe {
+                DeleteObject((*handle).cast());
+            },
+            _ => {}
         }
     }
 }
@@ -353,15 +395,21 @@ fn backup_clipboard() -> Result<Vec<(u32, ClipboardData)>, String> {
             }
             return Ok(backup);
         }
-        if !matches!(format, 1 | 7 | 13 | 16 | 0xC000..=0xFFFF) {
+        if !matches!(format, 1 | 2 | 7 | 13 | 16 | 0xC000..=0xFFFF) {
             return Err(format!(
                 "Clipboard format {format} cannot be backed up safely. Copy plain text or clear the clipboard before capturing. Clipboard left untouched."
             ));
         }
-        backup.push((
-            format,
-            ClipboardData::from_bytes(&clipboard_bytes(format)?)?,
-        ));
+        let data = if format == 2 {
+            let handle = unsafe { GetClipboardData(format) };
+            if handle.is_null() {
+                return Err("Cannot read the clipboard bitmap safely.".into());
+            }
+            ClipboardData::from_bitmap(handle.cast())?
+        } else {
+            ClipboardData::from_bytes(&clipboard_bytes(format)?)?
+        };
+        backup.push((format, data));
     }
 }
 
