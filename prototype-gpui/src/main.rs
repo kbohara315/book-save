@@ -1,3 +1,5 @@
+use futures::StreamExt;
+use gpui_kit::assets::icon_assets;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Selectable, Sizable, Theme, ThemeMode,
     button::{Button, ButtonVariants},
@@ -12,6 +14,8 @@ mod global_capture;
 use global_capture::{CaptureEvent, CaptureWorker};
 
 actions!(cooper, [FocusCapture, FocusSearch, CancelEdit]);
+
+icon_assets!(AppAssets, [Check, Close]);
 
 #[derive(Clone, Deserialize, Serialize)]
 struct Capture {
@@ -32,8 +36,106 @@ enum Composer {
     Edit { id: u64, capture_draft: String },
 }
 
+struct PersistRequest {
+    seq: u64,
+    snapshot: Vec<Capture>,
+    path: PathBuf,
+}
+
+struct PersistResult {
+    seq: u64,
+    result: Result<(), String>,
+}
+
+fn write_snapshot(path: &PathBuf, snapshot: &[Capture]) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = serde_json::to_vec_pretty(snapshot)?;
+    fs::create_dir_all(path.parent().expect("data directory"))?;
+    let temporary = path.with_extension("json.tmp");
+    let mut file = fs::File::create(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+struct PersistWorker {
+    tx: Option<std::sync::mpsc::Sender<PersistRequest>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PersistWorker {
+    fn new(completion: futures::channel::mpsc::UnboundedSender<PersistResult>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<PersistRequest>();
+        let thread = std::thread::spawn(move || {
+            while let Ok(req) = rx.recv() {
+                let result = write_snapshot(&req.path, &req.snapshot).map_err(|e| e.to_string());
+                let _ = completion.unbounded_send(PersistResult {
+                    seq: req.seq,
+                    result,
+                });
+            }
+        });
+        Self {
+            tx: Some(tx),
+            thread: Some(thread),
+        }
+    }
+
+    fn submit(&self, req: PersistRequest) -> bool {
+        match &self.tx {
+            Some(tx) => tx.send(req).is_ok(),
+            None => false,
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.tx.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for PersistWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+enum PendingEffect {
+    SubmitCapture,
+    SubmitEdit { capture_draft: String },
+    Toggle,
+    Delete { deleted_id: u64 },
+}
+
+struct PendingSave {
+    seq: u64,
+    snapshot: Vec<Capture>,
+    message: String,
+    effect: PendingEffect,
+}
+
+fn lowered_for(items: &[Capture]) -> Vec<String> {
+    items.iter().map(|item| item.text.to_lowercase()).collect()
+}
+
+fn filter_matches(filter: Filter, complete: bool) -> bool {
+    match filter {
+        Filter::All => true,
+        Filter::Open => !complete,
+        Filter::Done => complete,
+    }
+}
+
+fn can_deliver_deferred_capture(saving: bool, load_failed: bool, editing: bool) -> bool {
+    !saving && !load_failed && !editing
+}
+
 struct Cooper {
     items: Vec<Capture>,
+    lowered: Vec<String>,
     capture: Entity<InputState>,
     search: Entity<InputState>,
     composer: Composer,
@@ -44,7 +146,12 @@ struct Cooper {
     status: String,
     capture_status: String,
     capture_worker: CaptureWorker,
+    persist_worker: PersistWorker,
+    persist_next_seq: u64,
+    pending: Option<PendingSave>,
+    deferred_capture: Option<String>,
     _capture_events: Task<()>,
+    _persist_events: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -70,6 +177,7 @@ impl Cooper {
         let load_failed = loaded.is_err();
         let error = loaded.as_ref().err().map(|e| format!("Cannot load captures. {e} Your file has been left untouched. Repair data/captures.json and restart."));
         let items = loaded.unwrap_or_default();
+        let lowered = lowered_for(&items);
         let status = format!("{} captures loaded", items.len());
         let capture = cx.new(|cx| InputState::new(window, cx).placeholder("Capture a thought..."));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search captures..."));
@@ -86,31 +194,41 @@ impl Cooper {
         capture.update(cx, |input, cx| input.focus(window, cx));
         let (capture_worker, events) = global_capture::start();
         let capture_events = cx.spawn_in(window, async move |this, cx| {
-            loop {
-                while let Ok(event) = events.try_recv() {
-                    if this
-                        .update_in(cx, |this, window, cx| {
-                            this.receive_capture(event, window, cx);
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
+            let mut events = events;
+            while let Some(event) = events.next().await {
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        this.receive_capture(event, window, cx);
+                    })
+                    .is_err()
+                {
+                    break;
                 }
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(50))
-                    .await;
-                if this.upgrade().is_none() {
-                    return;
+            }
+        });
+        let (persist_tx, persist_rx) = futures::channel::mpsc::unbounded::<PersistResult>();
+        let persist_worker = PersistWorker::new(persist_tx);
+        let persist_events = cx.spawn_in(window, async move |this, cx| {
+            let mut persist_rx = persist_rx;
+            while let Some(result) = persist_rx.next().await {
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        this.on_persist_result(result, window, cx);
+                    })
+                    .is_err()
+                {
+                    break;
                 }
             }
         });
         let shutdown = cx.on_app_quit(|this, _| {
             this.capture_worker.stop();
+            this.persist_worker.shutdown();
             async {}
         });
         Self {
             items,
+            lowered,
             capture,
             search,
             composer: Composer::Capture,
@@ -121,7 +239,12 @@ impl Cooper {
             status,
             capture_status: "Starting global capture...".into(),
             capture_worker,
+            persist_worker,
+            persist_next_seq: 0,
+            pending: None,
+            deferred_capture: None,
             _capture_events: capture_events,
+            _persist_events: persist_events,
             _subscriptions: vec![submit, query, shutdown],
         }
     }
@@ -135,8 +258,15 @@ impl Cooper {
         self.capture_status = match event {
             CaptureEvent::Ready => "Select text in another app, then double-tap Left Shift.".into(),
             CaptureEvent::Failed(error) => format!("Global capture failed. {error}"),
-            CaptureEvent::SelectedText(_) if self.load_failed || matches!(self.composer, Composer::Edit { .. }) => {
+            CaptureEvent::SelectedText(_) if self.load_failed => {
+                "Global capture skipped. Resolve the load error first.".into()
+            }
+            CaptureEvent::SelectedText(_) if matches!(self.composer, Composer::Edit { .. }) => {
                 "Global capture skipped. Finish or cancel your edit and resolve any load error first.".into()
+            }
+            CaptureEvent::SelectedText(text) if self.pending.is_some() => {
+                self.deferred_capture = Some(text);
+                "Selected text queued until the current save finishes.".into()
             }
             CaptureEvent::SelectedText(text) => {
                 self.capture.update(cx, |input, cx| {
@@ -150,46 +280,146 @@ impl Cooper {
         cx.notify();
     }
 
-    fn persist(&mut self, items: Vec<Capture>, message: &str, cx: &mut Context<Self>) -> bool {
+    fn deliver_deferred_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !can_deliver_deferred_capture(
+            self.pending.is_some(),
+            self.load_failed,
+            matches!(self.composer, Composer::Edit { .. }),
+        ) {
+            return;
+        }
+        let Some(text) = self.deferred_capture.take() else {
+            return;
+        };
+        self.capture.update(cx, |input, cx| {
+            input.set_value(text, window, cx);
+            input.focus(window, cx);
+        });
+        window.activate_window();
+        self.capture_status = "Selected text is ready. Press Enter or Add to save.".into();
+        cx.notify();
+    }
+
+    fn base_items(&self) -> Vec<Capture> {
+        match &self.pending {
+            Some(pending) => pending.snapshot.clone(),
+            None => self.items.clone(),
+        }
+    }
+
+    fn queue_save(
+        &mut self,
+        snapshot: Vec<Capture>,
+        message: &str,
+        effect: PendingEffect,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.load_failed {
             return false;
         }
-        let saved = (|| -> Result<(), Box<dyn std::error::Error>> {
-            let bytes = serde_json::to_vec_pretty(&items)?;
-            fs::create_dir_all(self.path.parent().expect("data directory"))?;
-            let temporary = self.path.with_extension("json.tmp");
-            let mut file = fs::File::create(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(temporary, &self.path)?;
-            Ok(())
-        })();
-        match saved {
+        self.persist_next_seq += 1;
+        let seq = self.persist_next_seq;
+        let request = PersistRequest {
+            seq,
+            snapshot: snapshot.clone(),
+            path: self.path.clone(),
+        };
+        self.pending = Some(PendingSave {
+            seq,
+            snapshot,
+            message: message.to_owned(),
+            effect,
+        });
+        self.status = "Saving...".to_owned();
+        cx.notify();
+        if !self.persist_worker.submit(request) {
+            self.pending = None;
+            self.error = Some(
+                "Could not save. The background writer is unavailable. Your change has not been applied. Try again after fixing the file access."
+                    .to_owned(),
+            );
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
+    fn on_persist_result(
+        &mut self,
+        result: PersistResult,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        if result.seq != self.persist_next_seq || result.seq != pending.seq {
+            self.pending = Some(pending);
+            return;
+        }
+        match result.result {
             Ok(()) => {
-                self.items = items;
+                self.items = pending.snapshot;
+                self.lowered = lowered_for(&self.items);
                 self.error = None;
-                self.status = message.to_owned();
+                self.status = pending.message.clone();
+                match pending.effect {
+                    PendingEffect::SubmitCapture => {
+                        self.composer = Composer::Capture;
+                        self.filter = Filter::All;
+                        self.search
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        self.capture.update(cx, |input, cx| {
+                            input.set_value(String::new(), window, cx);
+                            input.focus(window, cx);
+                        });
+                    }
+                    PendingEffect::SubmitEdit { capture_draft } => {
+                        self.composer = Composer::Capture;
+                        self.capture.update(cx, |input, cx| {
+                            input.set_value(capture_draft, window, cx);
+                            input.focus(window, cx);
+                        });
+                    }
+                    PendingEffect::Toggle => {}
+                    PendingEffect::Delete { deleted_id } => {
+                        if matches!(self.composer, Composer::Edit { id: editing_id, .. } if editing_id == deleted_id)
+                        {
+                            self.cancel_edit(&CancelEdit, window, cx);
+                        }
+                    }
+                }
+                self.deliver_deferred_capture(window, cx);
                 cx.notify();
-                true
             }
             Err(e) => {
                 self.error = Some(format!(
                     "Could not save. {e} Your change has not been applied. Try again after fixing the file access."
                 ));
+                if self.deferred_capture.is_some() {
+                    self.capture_status =
+                        "Selected text is queued until the failed save is resolved.".into();
+                }
                 cx.notify();
-                false
             }
         }
     }
 
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn submit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let text = self.capture.read(cx).value().trim().to_owned();
         if text.is_empty() || self.load_failed {
             return;
         }
-        let mut items = self.items.clone();
-        let message = match &self.composer {
+        if self.pending.is_some() {
+            self.error = Some(
+                "Could not save. A previous save is still in progress. Your change has not been applied. Try again in a moment."
+                    .to_owned(),
+            );
+            cx.notify();
+            return;
+        }
+        let mut items = self.base_items();
+        let (message, effect) = match &self.composer {
             Composer::Capture => {
                 let Some(id) = items
                     .iter()
@@ -210,39 +440,30 @@ impl Cooper {
                         complete: false,
                     },
                 );
-                "Capture saved"
+                ("Capture saved", PendingEffect::SubmitCapture)
             }
             Composer::Edit { id, .. } => {
-                let Some(item) = items.iter_mut().find(|item| item.id == *id) else {
+                let id = *id;
+                let Some(item) = items.iter_mut().find(|item| item.id == id) else {
                     return;
                 };
                 item.text = text;
-                "Edit saved"
+                let capture_draft = match &self.composer {
+                    Composer::Edit { capture_draft, .. } => capture_draft.clone(),
+                    Composer::Capture => String::new(),
+                };
+                ("Edit saved", PendingEffect::SubmitEdit { capture_draft })
             }
         };
-        if self.persist(items, message, cx) {
-            let previous = std::mem::replace(&mut self.composer, Composer::Capture);
-            let draft = match previous {
-                Composer::Capture => {
-                    self.filter = Filter::All;
-                    self.search
-                        .update(cx, |input, cx| input.set_value("", window, cx));
-                    String::new()
-                }
-                Composer::Edit { capture_draft, .. } => capture_draft,
-            };
-            self.capture.update(cx, |input, cx| {
-                input.set_value(draft, window, cx);
-                input.focus(window, cx);
-            });
-        }
+        self.queue_save(items, message, effect, cx);
     }
 
     fn edit(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.load_failed {
+        if self.load_failed || self.pending.is_some() {
             return;
         }
-        let Some(item) = self.items.iter().find(|item| item.id == id) else {
+        let base = self.base_items();
+        let Some(item) = base.iter().find(|item| item.id == id) else {
             return;
         };
         let text = item.text.clone();
@@ -259,6 +480,9 @@ impl Cooper {
     }
 
     fn cancel_edit(&mut self, _: &CancelEdit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending.is_some() {
+            return;
+        }
         if let Composer::Edit { capture_draft, .. } =
             std::mem::replace(&mut self.composer, Composer::Capture)
         {
@@ -267,6 +491,7 @@ impl Cooper {
                 input.focus(window, cx);
             });
             cx.notify();
+            self.deliver_deferred_capture(window, cx);
         }
     }
 
@@ -282,20 +507,20 @@ impl Cooper {
 impl Render for Cooper {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.search.read(cx).value().to_lowercase();
-        let visible: Vec<_> = self
-            .items
-            .iter()
-            .filter(|item| {
-                (match self.filter {
-                    Filter::All => true,
-                    Filter::Open => !item.complete,
-                    Filter::Done => item.complete,
-                }) && item.text.to_lowercase().contains(&query)
-            })
-            .cloned()
-            .collect();
+        let mut visible_idx: Vec<usize> = Vec::new();
+        let mut open = 0usize;
+        for (index, (item, low)) in self.items.iter().zip(self.lowered.iter()).enumerate() {
+            if !item.complete {
+                open += 1;
+            }
+            if filter_matches(self.filter, item.complete) && low.contains(query.as_str()) {
+                visible_idx.push(index);
+            }
+        }
+        let matched = visible_idx.len();
+        let total = self.items.len();
         let editing = matches!(self.composer, Composer::Edit { .. });
-        let open = self.items.iter().filter(|item| !item.complete).count();
+        let saving = self.pending.is_some();
         let mut filters = div().flex().gap_1();
         for (index, (filter, label)) in [
             (Filter::All, "All"),
@@ -324,7 +549,7 @@ impl Render for Cooper {
             .min_h_0()
             .gap_2()
             .overflow_y_scroll();
-        if visible.is_empty() {
+        if visible_idx.is_empty() {
             cards = cards.child(
                 div()
                     .flex()
@@ -351,32 +576,49 @@ impl Render for Cooper {
                     ),
             );
         }
-        for item in visible {
+        for index in visible_idx {
+            let item = &self.items[index];
             let id = item.id;
+            let complete = item.complete;
+            let text = item.text.clone();
             let is_editing =
                 matches!(self.composer, Composer::Edit { id: editing_id, .. } if editing_id == id);
             cards = cards.child(div().id(("card", id)).flex().flex_col().flex_shrink_0().gap_3().p_3().rounded_lg()
                 .bg(cx.theme().secondary).border_1()
                 .border_color(if is_editing { cx.theme().primary } else { cx.theme().border })
-                .child(div().text_color(if item.complete { cx.theme().muted_foreground } else { cx.theme().foreground }).child(item.text))
+                .child(div().text_color(if complete { cx.theme().muted_foreground } else { cx.theme().foreground }).child(text))
                 .child(div().flex().items_center().justify_between().gap_2()
-                    .child(Checkbox::new(("complete", id)).label(if item.complete { "Completed" } else { "Mark complete" })
-                        .checked(item.complete).disabled(self.load_failed)
+                    .child(Checkbox::new(("complete", id)).label(if complete { "Completed" } else { "Mark complete" })
+                        .checked(complete).disabled(self.load_failed || saving)
                         .on_change(cx.listener(move |this, complete, _, cx| {
-                            let mut items = this.items.clone();
+                            if this.load_failed {
+                                return;
+                            }
+                            if this.pending.is_some() {
+                                this.error = Some("Could not save. A previous save is still in progress. Your change has not been applied. Try again in a moment.".to_owned());
+                                cx.notify();
+                                return;
+                            }
+                            let mut items = this.base_items();
                             if let Some(item) = items.iter_mut().find(|item| item.id == id) { item.complete = *complete; }
-                            this.persist(items, "Completion saved", cx);
+                            this.queue_save(items, "Completion saved", PendingEffect::Toggle, cx);
                         })))
                     .child(div().flex().gap_1()
-                        .child(Button::new(("edit", id)).ghost().small().label("Edit").disabled(self.load_failed)
+                        .child(Button::new(("edit", id)).ghost().small().label("Edit").disabled(self.load_failed || saving)
                             .on_click(cx.listener(move |this, _, window, cx| this.edit(id, window, cx))))
-                        .child(Button::new(("delete", id)).ghost().small().label("Delete").disabled(self.load_failed)
+                        .child(Button::new(("delete", id)).ghost().small().label("Delete").disabled(self.load_failed || saving)
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                let items = this.items.iter().filter(|item| item.id != id).cloned().collect();
-                                if this.persist(items, "Capture deleted", cx)
-                                    && matches!(this.composer, Composer::Edit { id: editing_id, .. } if editing_id == id) {
-                                    this.cancel_edit(&CancelEdit, window, cx);
+                                if this.load_failed {
+                                    return;
                                 }
+                                if this.pending.is_some() {
+                                    this.error = Some("Could not save. A previous save is still in progress. Your change has not been applied. Try again in a moment.".to_owned());
+                                    cx.notify();
+                                    return;
+                                }
+                                let items = this.base_items().into_iter().filter(|item| item.id != id).collect();
+                                this.queue_save(items, "Capture deleted", PendingEffect::Delete { deleted_id: id }, cx);
+                                let _ = window;
                             }))))));
         }
         let mut composer = div()
@@ -387,19 +629,26 @@ impl Render for Cooper {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(Input::new(&self.capture).disabled(self.load_failed)),
+                    .child(Input::new(&self.capture).disabled(self.load_failed || saving)),
             )
             .child(
                 Button::new("add")
                     .primary()
                     .label(if editing { "Save" } else { "Add" })
-                    .disabled(self.load_failed)
+                    .disabled(self.load_failed || saving)
                     .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
             );
         if editing {
-            composer = composer.child(Button::new("cancel").ghost().label("Cancel").on_click(
-                cx.listener(|this, _, window, cx| this.cancel_edit(&CancelEdit, window, cx)),
-            ));
+            composer =
+                composer.child(
+                    Button::new("cancel")
+                        .ghost()
+                        .label("Cancel")
+                        .disabled(saving)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.cancel_edit(&CancelEdit, window, cx)
+                        })),
+                );
         }
         let mut content = div()
             .size_full()
@@ -454,18 +703,7 @@ impl Render for Cooper {
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{} of {}",
-                                self.items
-                                    .iter()
-                                    .filter(|item| {
-                                        (self.filter == Filter::All
-                                            || (self.filter == Filter::Done) == item.complete)
-                                            && item.text.to_lowercase().contains(&query)
-                                    })
-                                    .count(),
-                                self.items.len()
-                            )),
+                            .child(format!("{matched} of {total}")),
                     ),
             );
         if let Some(error) = &self.error {
@@ -503,7 +741,7 @@ impl Render for Cooper {
 }
 
 fn main() {
-    application().with_assets(assets::Assets).run(|cx| {
+    application().with_assets(AppAssets).run(|cx| {
         init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         cx.bind_keys([
@@ -533,4 +771,226 @@ fn main() {
         .expect("open Cooper window");
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use super::{
+        Capture, Filter, PersistRequest, PersistWorker, can_deliver_deferred_capture,
+        filter_matches, lowered_for, write_snapshot,
+    };
+    use std::collections::HashSet;
+
+    fn sample_items() -> Vec<Capture> {
+        vec![
+            Capture {
+                id: 2,
+                text: "Plan the Cooper capture PANEL".into(),
+                complete: true,
+            },
+            Capture {
+                id: 1,
+                text: "Read the capture notes".into(),
+                complete: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn filter_search_preserves_order_and_case_insensitive_match() {
+        let items = sample_items();
+        let lowered = lowered_for(&items);
+        assert_eq!(lowered.len(), items.len());
+        let query = "panel".to_lowercase();
+        let mut visible = Vec::new();
+        for (item, low) in items.iter().zip(lowered.iter()) {
+            if filter_matches(Filter::All, item.complete) && low.contains(query.as_str()) {
+                visible.push(item.id);
+            }
+        }
+        assert_eq!(visible, vec![2]);
+        let query = "PANEL".to_lowercase();
+        let mut visible = Vec::new();
+        for (item, low) in items.iter().zip(lowered.iter()) {
+            if filter_matches(Filter::All, item.complete) && low.contains(query.as_str()) {
+                visible.push(item.id);
+            }
+        }
+        assert_eq!(visible, vec![2]);
+    }
+
+    #[test]
+    fn filter_open_done_split() {
+        let items = sample_items();
+        let lowered = lowered_for(&items);
+        let query = String::new();
+        let open: Vec<u64> = items
+            .iter()
+            .zip(lowered.iter())
+            .filter(|(item, low)| {
+                filter_matches(Filter::Open, item.complete) && low.contains(query.as_str())
+            })
+            .map(|(item, _)| item.id)
+            .collect();
+        assert_eq!(open, vec![1]);
+        let done: Vec<u64> = items
+            .iter()
+            .zip(lowered.iter())
+            .filter(|(item, low)| {
+                filter_matches(Filter::Done, item.complete) && low.contains(query.as_str())
+            })
+            .map(|(item, _)| item.id)
+            .collect();
+        assert_eq!(done, vec![2]);
+    }
+
+    #[test]
+    fn single_pass_count_matches_visible() {
+        let items = sample_items();
+        let lowered = lowered_for(&items);
+        let query = "".to_lowercase();
+        let mut visible = 0usize;
+        let mut open = 0usize;
+        for (item, low) in items.iter().zip(lowered.iter()) {
+            if !item.complete {
+                open += 1;
+            }
+            if filter_matches(Filter::All, item.complete) && low.contains(query.as_str()) {
+                visible += 1;
+            }
+        }
+        assert_eq!(visible, 2);
+        assert_eq!(open, 1);
+    }
+
+    #[test]
+    fn persist_bytes_match_pretty_schema_and_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "cooper-perf-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("captures.json");
+        let items = sample_items();
+        write_snapshot(&path, &items).unwrap();
+        assert!(!path.with_extension("json.tmp").exists());
+        let bytes = std::fs::read(&path).unwrap();
+        let expected = serde_json::to_vec_pretty(&items).unwrap();
+        assert_eq!(bytes, expected);
+        let back: Vec<Capture> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.len(), 2);
+        let mut ids = HashSet::new();
+        assert!(
+            !back
+                .iter()
+                .any(|item| item.text.trim().is_empty() || !ids.insert(item.id))
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_replacement_is_atomic_no_tmp_left() {
+        let dir = std::env::temp_dir().join(format!(
+            "cooper-perf-atomic-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("captures.json");
+        let first = vec![Capture {
+            id: 1,
+            text: "first".into(),
+            complete: false,
+        }];
+        let second = vec![
+            Capture {
+                id: 1,
+                text: "first".into(),
+                complete: true,
+            },
+            Capture {
+                id: 2,
+                text: "second".into(),
+                complete: false,
+            },
+        ];
+        write_snapshot(&path, &first).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        write_snapshot(&path, &second).unwrap();
+        let after = std::fs::read(&path).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(after, serde_json::to_vec_pretty(&second).unwrap());
+        assert!(!path.with_extension("json.tmp").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn event_channel_delivers_without_polling() {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<String>();
+        tx.unbounded_send("ready".to_owned()).unwrap();
+        tx.unbounded_send("text".to_owned()).unwrap();
+        drop(tx);
+        let collected = futures::executor::block_on(async {
+            let mut out = Vec::new();
+            while let Some(msg) = futures::StreamExt::next(&mut rx).await {
+                out.push(msg);
+            }
+            out
+        });
+        assert_eq!(collected, vec!["ready".to_owned(), "text".to_owned()]);
+    }
+
+    #[test]
+    fn persist_queue_is_fifo_ordered() {
+        let dir = std::env::temp_dir().join(format!(
+            "cooper-perf-fifo-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("captures.json");
+        let (completion, mut results) = futures::channel::mpsc::unbounded();
+        let mut worker = PersistWorker::new(completion);
+        let first = sample_items();
+        let second = vec![Capture {
+            id: 3,
+            text: "third snapshot".into(),
+            complete: false,
+        }];
+        for (seq, snapshot) in [(1, first), (2, second.clone())] {
+            assert!(worker.submit(PersistRequest {
+                seq,
+                snapshot,
+                path: path.clone(),
+            }));
+        }
+        worker.shutdown();
+        let completed = futures::executor::block_on(async {
+            let mut seqs = Vec::new();
+            while let Some(result) = futures::StreamExt::next(&mut results).await {
+                result.result.unwrap();
+                seqs.push(result.seq);
+            }
+            seqs
+        });
+        assert_eq!(completed, vec![1, 2]);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes, serde_json::to_vec_pretty(&second).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deferred_capture_waits_for_save_and_non_edit_state() {
+        assert!(!can_deliver_deferred_capture(true, false, false));
+        assert!(!can_deliver_deferred_capture(false, true, false));
+        assert!(!can_deliver_deferred_capture(false, false, true));
+        assert!(can_deliver_deferred_capture(false, false, false));
+    }
 }

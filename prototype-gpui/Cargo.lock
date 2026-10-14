@@ -963,6 +963,7 @@ dependencies = [
 name = "cooper-gpui-prototype"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "gpui-kit",
  "serde",
  "serde_json",

@@ -518,11 +518,24 @@ fn verify_capture() -> Result<(), String> {
         );
     }
     source.focus()?;
-    let (events, receiver) = std::sync::mpsc::channel();
+    let (events, mut receiver) = futures::channel::mpsc::unbounded();
     let mut hook = CaptureWorker::start(events);
-    match receiver.recv_timeout(Duration::from_secs(1)) {
-        Ok(super::CaptureEvent::Ready) => {}
-        _ => return Err("Global keyboard hook did not start".into()),
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let ready = loop {
+        match receiver.try_recv() {
+            Ok(super::CaptureEvent::Ready) => break true,
+            Ok(_) => break false,
+            Err(e) if e.is_closed() => break false,
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    if !ready {
+        return Err("Global keyboard hook did not start".into());
     }
     let key = |flags| INPUT {
         r#type: INPUT_KEYBOARD,
@@ -545,7 +558,11 @@ fn verify_capture() -> Result<(), String> {
     {
         return Err("Could not exercise injected key rejection".into());
     }
-    if receiver.recv_timeout(Duration::from_millis(200)).is_ok() {
+    if receiver.try_recv().is_ok() {
+        return Err("Injected double Shift unexpectedly triggered capture".into());
+    }
+    thread::sleep(Duration::from_millis(200));
+    if receiver.try_recv().is_ok() {
         return Err("Injected double Shift unexpectedly triggered capture".into());
     }
     hook.stop();

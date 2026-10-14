@@ -1,5 +1,15 @@
 # Prototype verification
 
+## Performance and architecture pass, 2026-10-15
+
+Implemented event-driven delivery for capture and persistence events, removed the Windows clipboard worker's 50 ms idle polling by signaling its message thread, cached lowercase capture text for search, and made list filtering/counting a single pass without cloning capture strings during rendering. JSON writes now run on a FIFO background worker, write and flush a temporary file before replacement, and update the visible list only after a successful save. The UI disables conflicting edits while saving and queues a global capture until the save completes. The GPUI Kit icon bundle now includes only Check and Close.
+
+Validation on Windows: `cargo test --locked --offline` passed all 8 tests; `cargo check --locked --offline` and optimized release build succeeded; rustfmt check and `git diff --check` passed. The native clipboard verifier exited 0 and passed all formats, no-selection restoration, private-format refusal, injected Shift rejection, 20 repeated image captures without GDI object growth, and exact clipboard restoration. The verifier does not generate a physical Shift gesture or drive the GPUI view; the physical gesture was previously exercised by the user.
+
+The final release benchmark ran 7 launches with 12-second idle samples on an Intel i5-1235U (10 cores / 12 logical processors). All runs completed, `data/captures.json` SHA-256 was unchanged, and the release executable was 24,197,120 bytes. Warm startup median was 532.75 ms (range 513.63–689.18 ms, 6 runs); including the cold-ish first launch, median was 582.69 ms (513.63-1,589.42 ms). Working set median was 79.58 MiB (79.16–81.43); private memory median was 83.41 MiB (83.17–83.43). Idle CPU was 2.34% median over all runs and 2.405% over the six warm runs (0.65–2.73%).
+
+Compared with the earlier 7-run baseline, startup and memory are within run variation. The executable is 10,752 bytes smaller (about 0.04%) than the 24,207,872-byte baseline. Idle CPU does not establish an improvement: the machine had active desktop processes, and the sample ranges overlap the baseline. Treat CPU and small startup differences as inconclusive. This harness measures window-handle readiness, process CPU and memory during idle, and executable size; it does not measure typing latency, large-list scaling, or physical gesture-to-field latency.
+
 ## Clipboard capture regression, 2026-10-15
 
 The user's repeated failures progressed through HTML Format, `CF_BITMAP` (2), and `CF_DIB` (8). The read-only verification tool reproduced the last error on the actual Windows clipboard. Its eight formats included `CF_BITMAP`, PNG, `CF_DIB`, and `CF_DIBV5`. Supporting one representation left another representation of the same image unsupported.

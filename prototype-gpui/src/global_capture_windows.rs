@@ -1,4 +1,5 @@
-use super::{CaptureEvent, Sender};
+use super::CaptureEvent;
+use futures::channel::mpsc::UnboundedSender;
 use std::{
     cell::RefCell,
     mem::size_of,
@@ -43,10 +44,13 @@ enum ShiftGesture {
     Triggered(usize),
 }
 
+const WM_CAPTURE_SELECTION: u32 = WM_APP + 1;
+
 struct HookState {
     gesture: ShiftGesture,
     requests: SyncSender<usize>,
     busy: Arc<AtomicBool>,
+    copy_thread_id: u32,
 }
 
 thread_local! {
@@ -59,7 +63,7 @@ pub struct CaptureWorker {
 }
 
 impl CaptureWorker {
-    pub(super) fn start(events: Sender<CaptureEvent>) -> Self {
+    pub(super) fn start(events: UnboundedSender<CaptureEvent>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let (ready, receive_ready) = sync_channel(1);
@@ -69,27 +73,37 @@ impl CaptureWorker {
             let copy_busy = busy.clone();
             let copy_events = events.clone();
             let copy_stop = worker_stop.clone();
+            let (copy_ready, receive_copy_ready) = sync_channel(1);
             let copy_thread = thread::spawn(move || {
                 let owner = ClipboardWindow::new();
+                let mut message = MSG::default();
+                PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE);
+                let _ = copy_ready.send(GetCurrentThreadId());
                 while !copy_stop.load(Ordering::Acquire) {
-                    service_thread_messages();
-                    match receive_requests.recv_timeout(Duration::from_millis(50)) {
-                        Ok(source) => {
-                            let result = owner.as_ref().map_err(Clone::clone).and_then(|owner| {
-                                capture_selection(owner.0, source as HWND, &copy_stop)
-                            });
-                            let event = match result {
-                                Ok(text) => CaptureEvent::SelectedText(text),
-                                Err(error) => CaptureEvent::Failed(error),
-                            };
-                            let _ = copy_events.send(event);
-                            copy_busy.store(false, Ordering::Release);
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    let result = GetMessageW(&mut message, null_mut(), 0, 0);
+                    if result <= 0 {
+                        break;
+                    }
+                    if message.message == WM_CAPTURE_SELECTION {
+                        let Ok(source) = receive_requests.try_recv() else {
+                            continue;
+                        };
+                        let result = owner.as_ref().map_err(Clone::clone).and_then(|owner| {
+                            capture_selection(owner.0, source as HWND, &copy_stop)
+                        });
+                        let event = match result {
+                            Ok(text) => CaptureEvent::SelectedText(text),
+                            Err(error) => CaptureEvent::Failed(error),
+                        };
+                        let _ = copy_events.unbounded_send(event);
+                        copy_busy.store(false, Ordering::Release);
+                    } else {
+                        TranslateMessage(&message);
+                        DispatchMessageW(&message);
                     }
                 }
             });
+            let copy_thread_id = receive_copy_ready.recv().unwrap_or(0);
             let mut message = MSG::default();
             PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE);
             HOOK.with(|state| {
@@ -101,6 +115,7 @@ impl CaptureWorker {
                     },
                     requests,
                     busy,
+                    copy_thread_id,
                 });
             });
             let hook = SetWindowsHookExW(
@@ -111,17 +126,17 @@ impl CaptureWorker {
             );
             let _ = ready.send(GetCurrentThreadId());
             if hook.is_null() {
-                let _ = events.send(CaptureEvent::Failed(format!(
+                let _ = events.unbounded_send(CaptureEvent::Failed(format!(
                     "Cannot install the global keyboard hook. {}",
                     std::io::Error::last_os_error()
                 )));
             } else {
-                let _ = events.send(CaptureEvent::Ready);
+                let _ = events.unbounded_send(CaptureEvent::Ready);
                 loop {
                     let result = GetMessageW(&mut message, null_mut(), 0, 0);
                     if result <= 0 {
                         if result < 0 {
-                            let _ = events.send(CaptureEvent::Failed(
+                            let _ = events.unbounded_send(CaptureEvent::Failed(
                                 "The global keyboard hook stopped unexpectedly.".into(),
                             ));
                         }
@@ -133,6 +148,7 @@ impl CaptureWorker {
                 UnhookWindowsHookEx(hook);
             }
             worker_stop.store(true, Ordering::Release);
+            PostThreadMessageW(copy_thread_id, WM_QUIT, 0, 0);
             HOOK.with(|state| *state.borrow_mut() = None);
             let _ = copy_thread.join();
         });
@@ -201,6 +217,16 @@ unsafe extern "system" fn keyboard_hook(code: i32, message: WPARAM, data: LPARAM
                                 {
                                     if state.requests.try_send(source).is_err() {
                                         state.busy.store(false, Ordering::Release);
+                                    } else if unsafe {
+                                        PostThreadMessageW(
+                                            state.copy_thread_id,
+                                            WM_CAPTURE_SELECTION,
+                                            0,
+                                            0,
+                                        )
+                                    } == 0
+                                    {
+                                        state.busy.store(false, Ordering::Release);
                                     }
                                 }
                             }
@@ -229,6 +255,10 @@ fn service_thread_messages() {
     unsafe {
         // PeekMessage also delivers synchronous clipboard owner notifications.
         while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+            if message.message == WM_QUIT {
+                PostQuitMessage(message.wParam as i32);
+                break;
+            }
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }

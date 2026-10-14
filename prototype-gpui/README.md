@@ -68,7 +68,21 @@ The app saves a JSON array to `data\captures.json` inside this project. Each cap
 
 If the file cannot load, the app displays the error and disables mutations to protect the existing file. Repair the file and restart. Run one app process at a time. This prototype has no file locking or multi-process merge behavior.
 
-The prototype has no tray, image import, sections, sync, or performance measurements. **Ctrl+N** and **Ctrl+F** apply only while its window is focused.
+The prototype has no tray, image import, sections, or sync. **Ctrl+N** and **Ctrl+F** apply only while its window is focused.
+
+## Benchmark the Windows build
+
+Run `.\bench.ps1` from this directory after building the release executable:
+
+```powershell
+$env:CARGO_HOME = '.local\cargo'
+$env:RUSTUP_HOME = '.local\rustup'
+$env:CARGO_TARGET_DIR = 'target'
+rustup run stable-x86_64-pc-windows-msvc cargo build --release --locked
+.\bench.ps1 -Runs 7 -IdleSeconds 12
+```
+
+The benchmark launches Cooper seven times, waits for its main window handle, samples process CPU and memory during each 12-second idle period, and records executable size. The first run is marked cold-ish and later runs warm. CSV output goes to `.local\bench-results.csv`. The script refuses to run when another Cooper process is open and checks that `data\captures.json` is unchanged.
 
 ## Verify Windows clipboard capture
 

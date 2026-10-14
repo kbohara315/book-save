@@ -1,5 +1,3 @@
-use std::sync::mpsc::Sender;
-
 pub enum CaptureEvent {
     Ready,
     SelectedText(String),

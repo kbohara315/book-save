@@ -1,4 +1,6 @@
-use std::sync::mpsc::{Receiver, Sender, channel};
+#[cfg(not(windows))]
+use futures::channel::mpsc::UnboundedSender;
+use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 
 pub enum CaptureEvent {
     Ready,
@@ -17,8 +19,8 @@ pub struct CaptureWorker;
 
 #[cfg(not(windows))]
 impl CaptureWorker {
-    fn start(events: Sender<CaptureEvent>) -> Self {
-        let _ = events.send(CaptureEvent::Failed(
+    fn start(events: UnboundedSender<CaptureEvent>) -> Self {
+        let _ = events.unbounded_send(CaptureEvent::Failed(
             "Global capture is supported only on Windows. Type into the capture field instead."
                 .into(),
         ));
@@ -28,7 +30,7 @@ impl CaptureWorker {
     pub fn stop(&mut self) {}
 }
 
-pub fn start() -> (CaptureWorker, Receiver<CaptureEvent>) {
-    let (events, receiver) = channel();
+pub fn start() -> (CaptureWorker, UnboundedReceiver<CaptureEvent>) {
+    let (events, receiver) = unbounded();
     (CaptureWorker::start(events), receiver)
 }
