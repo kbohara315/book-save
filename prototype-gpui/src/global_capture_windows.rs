@@ -353,7 +353,7 @@ fn backup_clipboard() -> Result<Vec<(u32, ClipboardData)>, String> {
             }
             return Ok(backup);
         }
-        if !matches!(format, 1 | 7 | 13 | 16) {
+        if !matches!(format, 1 | 7 | 13 | 16 | 0xC000..=0xFFFF) {
             return Err(format!(
                 "Clipboard format {format} cannot be backed up safely. Copy plain text or clear the clipboard before capturing. Clipboard left untouched."
             ));

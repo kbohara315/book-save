@@ -115,7 +115,7 @@ The two candidate OS designs were a `WH_KEYBOARD_LL` callback on a dedicated mes
 
 The hook uses `ShiftGesture` to track released, pressed, and triggered states. It recognizes distinct Left Shift key-down events at most 350 milliseconds apart and queues the copy on the second key-up. This avoids racing the asynchronous Shift state update. Repeats and injected events do not advance the gesture. Other physical key-down events cancel the pending tap. Other held modifiers block the pair. Requests do not overlap.
 
-Before changing the clipboard, the worker duplicates every supported format into owned movable memory. It supports an empty clipboard and `CF_TEXT`, `CF_OEMTEXT`, `CF_UNICODETEXT`, and `CF_LOCALE`, with a 16 MiB limit per format. Other formats cause a refusal before any copy command. The worker uses a message-only owner window, since clipboard restoration needs a valid owner. See [SetClipboardData](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setclipboarddata).
+Before changing the clipboard, the worker duplicates every supported format into owned movable memory. It supports an empty clipboard and `CF_TEXT`, `CF_OEMTEXT`, `CF_UNICODETEXT`, and `CF_LOCALE`. It also preserves registered formats in the inclusive ID range `0xC000` through `0xFFFF`, including HTML and RTF. Windows requires registered clipboard data to use HGLOBAL handles. See [RegisterClipboardFormatA](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerclipboardformata). Each format must have a nonzero `GlobalSize` of at most 16 MiB and pass `GlobalLock` before copying. Unsupported predefined formats, including non-HGLOBAL formats, and data that fails these bounds or memory checks cause a refusal before any copy command. The worker uses a message-only owner window, since clipboard restoration needs a valid owner. See [SetClipboardData](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setclipboarddata).
 
 An empty Unicode marker separates a fresh copy from stale clipboard text. The worker waits up to 800 milliseconds for a changed clipboard sequence and accepts Unicode text only from a clipboard owner in the source process. It restores the original formats after success or no usable selection. A changed sequence after reading cancels restoration, preserving the newer clipboard. Clipboard contention or failed restoration produces an error. Clipboard history may retain the temporary contents. A source app that copies after the timeout may replace the clipboard later.
 
@@ -132,11 +132,11 @@ Model the Domain shaped the `CaptureEvent` enum and the single owner for each ki
 
 ### Physical checks still required
 
-Use a real keyboard with a source app such as Notepad and an empty or plain-text clipboard. These checks have not been run by the implementation delegate:
+Use a real keyboard with a source app such as Notepad. These checks have not been run by the implementation delegate:
 
 1. Select Unicode text in the source app, double-tap Left Shift within 350 milliseconds, and release. Confirm one draft arrives, nothing saves automatically, and the original clipboard returns.
 2. Try no selection, whitespace-only text, a held Shift, Right Shift, key repeats, another modifier held, three rapid taps, and a pair more than 350 milliseconds apart. Confirm only a valid pair captures once. Account for editors that copy a whole line without a selection.
-3. Put an image or rich text on the clipboard. Confirm capture refuses without changing the clipboard. Try clipboard contention and a source app running elevated.
+3. Put HTML or RTF on the clipboard with all formats within the backup bounds. Confirm capture succeeds and restores the original formats. Put an unsupported predefined format such as a bitmap on the clipboard, or a format larger than 16 MiB. Confirm capture refuses without changing the clipboard. Try clipboard contention and a source app running elevated.
 4. Capture while editing a card. Confirm the edit remains intact. Close Cooper during a pending capture and confirm the process exits and subsequent taps do nothing.
 
 An injected-input check can verify rejection. It is not evidence of physical gesture success or of successful clipboard rollback.
@@ -170,3 +170,17 @@ Computer Use drove the actual built executable with injected input. The observed
 The observed running window is saved at [.local/global-capture-window.png](.local/global-capture-window.png). Its accessibility tree is saved at [.local/global-capture-accessibility.txt](.local/global-capture-accessibility.txt). These files and the empty demonstration data file are untracked verification artifacts in this worktree. The first screenshot returned background content before activation. Explicit activation returned the actual Cooper window. This screenshot anomaly does not establish an app crash.
 
 Physical gesture success, successful OS selection capture, clipboard restoration, clipboard failure paths, and shutdown during an active copy remain unverified. Filters, search, edit cancellation, accessibility support, and other platforms were not rechecked in this session. No automated tests were added or run. A narrow delegated comment audit reported zero comments to delete and no suppression attributes. The coordinating parent owns broader correctness review.
+
+### Registered clipboard format fix
+
+The fix starts from `dccafc2` in `C:\Users\ACER\.t3\worktrees\book-save\t3-8d3805c4`. It extends only the backup format check to include registered IDs. The bounded HGLOBAL copy, clipboard sequence and owner checks, and restoration logic remain unchanged.
+
+These commands exited with code 0 in this worktree's `prototype-gpui` directory:
+
+```powershell
+& 'C:\Users\ACER\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustfmt.exe' --edition 2024 src/main.rs src/global_capture.rs src/global_capture_windows.rs
+& 'C:\Users\ACER\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustfmt.exe' --check --edition 2024 src/main.rs src/global_capture.rs src/global_capture_windows.rs
+rustup run stable cargo build --locked --offline
+```
+
+The Windows build used the existing prototype's `.local\cargo` and `.local\rustup` directories and the Visual Studio CMake directory documented above. Build output stayed in this worktree's `prototype-gpui\target`. No automated tests or runtime clipboard checks were run for this fix. The coordinating parent owns review and runtime verification.
