@@ -50,7 +50,13 @@ The capture replaces the current unsaved capture draft. An active edit or a load
 
 The shortcut ignores key repeats, injected input, Right Shift, and gestures with another modifier held. Another key press cancels the pending tap. Captures do not overlap. UI automation sends injected keystrokes, so it cannot prove that the physical gesture works.
 
-Cooper temporarily sends **Ctrl+C** to the foreground app and reads fresh Unicode clipboard text. It waits up to 800 milliseconds for a copy. It restores the original clipboard after success or an unusable selection. An empty clipboard and standard text formats are supported, including ANSI text, OEM text, Unicode text, and locale data. Registered formats such as HTML and RTF are preserved when every format can be backed up safely as HGLOBAL memory. `CF_BITMAP` is backed up as a copied GDI bitmap. Clipboard data must be nonempty and at most 16 MiB; unsupported predefined formats, including file data, cause a visible refusal before the clipboard changes. Data that exceeds the limit or cannot be copied safely also causes a refusal. Copy plain text or clear the clipboard before retrying after a refusal.
+Cooper temporarily sends **Ctrl+C** to the foreground app and reads fresh Unicode clipboard text. It waits up to 800 milliseconds for a copy. It restores the original clipboard after success or an unusable selection. An empty clipboard is supported. The backup copies these formats according to their storage type:
+
+- HGLOBAL memory for ANSI text, OEM text, Unicode text, locale data, SYLK, DIF, TIFF, DIB, DIBV5, RIFF, WAVE, file lists (`CF_HDROP`), and display text (`CF_DSPTEXT`). Registered formats such as HTML, RTF, and PNG use the same memory backup.
+- A copied GDI bitmap for `CF_BITMAP` and `CF_DSPBITMAP`.
+- A copied logical palette for `CF_PALETTE`.
+
+Each format must be nonempty and at most 16 MiB. Owner-display, pen data, metafile formats, reserved formats, and private handle formats cause a visible refusal before the clipboard changes. Data that exceeds the limit or cannot be copied safely also causes a refusal. Copy plain text or clear the clipboard before retrying after a refusal. This coverage describes the implementation. Physical shortcut and runtime verification of the expanded format support remain pending.
 
 If another process takes ownership of the clipboard during capture, Cooper cancels and leaves that process's clipboard alone. Clipboard access or restoration can fail if another app holds the clipboard. These failures appear in the app. Clipboard history and clipboard managers may observe the temporary copy. An app that completes its copy after the timeout can still change the clipboard later.
 

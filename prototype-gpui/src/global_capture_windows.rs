@@ -13,7 +13,10 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{GetLastError, GlobalFree, HGLOBAL, HWND, LPARAM, LRESULT, SetLastError, WPARAM},
-    Graphics::Gdi::{BITMAP, DeleteObject, GetObjectW, HBITMAP},
+    Graphics::Gdi::{
+        BITMAP, CreatePalette, DeleteObject, GetObjectW, GetPaletteEntries, HBITMAP, HPALETTE,
+        LOGPALETTE, PALETTEENTRY,
+    },
     System::{
         DataExchange::*,
         LibraryLoader::GetModuleHandleW,
@@ -285,6 +288,7 @@ impl Drop for Clipboard {
 enum ClipboardData {
     Global(HGLOBAL),
     Bitmap(HBITMAP),
+    Palette(HPALETTE),
 }
 
 impl ClipboardData {
@@ -334,10 +338,37 @@ impl ClipboardData {
         Ok(Self::Bitmap(copy.cast()))
     }
 
+    fn from_palette(handle: HPALETTE) -> Result<Self, String> {
+        let count = unsafe { GetPaletteEntries(handle, 0, 0, null_mut()) };
+        if count == 0 || count > u16::MAX as u32 {
+            return Err("Clipboard palette is empty or cannot be backed up safely.".into());
+        }
+        let byte_size = size_of::<LOGPALETTE>() + (count as usize - 1) * size_of::<PALETTEENTRY>();
+        if byte_size > 16 * 1024 * 1024 {
+            return Err("Clipboard palette is too large to back up safely.".into());
+        }
+        let mut storage = vec![LOGPALETTE::default(); byte_size.div_ceil(size_of::<LOGPALETTE>())];
+        let palette = storage.as_mut_ptr();
+        unsafe {
+            (*palette).palVersion = 0x0300;
+            (*palette).palNumEntries = count as u16;
+            let entries = std::ptr::addr_of_mut!((*palette).palPalEntry).cast();
+            if GetPaletteEntries(handle, 0, count, entries) != count {
+                return Err("Cannot read the clipboard palette safely.".into());
+            }
+        }
+        let copy = unsafe { CreatePalette(palette) };
+        if copy.is_null() {
+            return Err("Cannot copy the clipboard palette safely.".into());
+        }
+        Ok(Self::Palette(copy))
+    }
+
     fn put(self, format: u32) -> Result<(), String> {
         let handle = match &self {
             Self::Global(handle) => *handle,
             Self::Bitmap(handle) => *handle,
+            Self::Palette(handle) => *handle,
         };
         if unsafe { SetClipboardData(format, handle) }.is_null() {
             return Err("Cannot restore clipboard data.".into());
@@ -354,6 +385,9 @@ impl Drop for ClipboardData {
                 GlobalFree(*handle);
             },
             Self::Bitmap(handle) if !handle.is_null() => unsafe {
+                DeleteObject((*handle).cast());
+            },
+            Self::Palette(handle) if !handle.is_null() => unsafe {
                 DeleteObject((*handle).cast());
             },
             _ => {}
@@ -395,20 +429,37 @@ fn backup_clipboard() -> Result<Vec<(u32, ClipboardData)>, String> {
             }
             return Ok(backup);
         }
-        if !matches!(format, 1 | 2 | 7 | 13 | 16 | 0xC000..=0xFFFF) {
-            return Err(format!(
-                "Clipboard format {format} cannot be backed up safely. Copy plain text or clear the clipboard before capturing. Clipboard left untouched."
-            ));
-        }
-        let data = if format == 2 {
-            let handle = unsafe { GetClipboardData(format) };
-            if handle.is_null() {
-                return Err("Cannot read the clipboard bitmap safely.".into());
-            }
-            ClipboardData::from_bitmap(handle.cast())?
-        } else {
-            ClipboardData::from_bytes(&clipboard_bytes(format)?)?
+        let unsupported = |name: &str| {
+            Err(format!(
+                "Clipboard {name} ({format}) cannot be backed up safely. Copy plain text or clear the clipboard before capturing. Clipboard left untouched."
+            ))
         };
+        let data = match format {
+            1 | 4 | 5 | 6 | 7 | 8 | 11 | 12 | 13 | 15 | 16 | 17 | 0x81 | 0xC000..=0xFFFF => {
+                ClipboardData::from_bytes(&clipboard_bytes(format)?)
+            }
+            2 | 0x82 => {
+                let handle = unsafe { GetClipboardData(format) };
+                if handle.is_null() {
+                    return Err("Cannot read the clipboard bitmap safely.".into());
+                }
+                ClipboardData::from_bitmap(handle.cast())
+            }
+            9 => {
+                let handle = unsafe { GetClipboardData(format) };
+                if handle.is_null() {
+                    return Err("Cannot read the clipboard palette safely.".into());
+                }
+                ClipboardData::from_palette(handle.cast())
+            }
+            3 => unsupported("CF_METAFILEPICT"),
+            10 => unsupported("CF_PENDATA"),
+            14 => unsupported("CF_ENHMETAFILE"),
+            0x80 => unsupported("CF_OWNERDISPLAY"),
+            0x83 => unsupported("CF_DSPMETAFILEPICT"),
+            0x8E => unsupported("CF_DSPENHMETAFILE"),
+            _ => unsupported("format"),
+        }?;
         backup.push((format, data));
     }
 }
