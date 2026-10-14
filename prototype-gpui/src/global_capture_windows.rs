@@ -72,6 +72,7 @@ impl CaptureWorker {
             let copy_thread = thread::spawn(move || {
                 let owner = ClipboardWindow::new();
                 while !copy_stop.load(Ordering::Acquire) {
+                    service_thread_messages();
                     match receive_requests.recv_timeout(Duration::from_millis(50)) {
                         Ok(source) => {
                             let result = owner.as_ref().map_err(Clone::clone).and_then(|owner| {
@@ -223,6 +224,17 @@ fn modifiers_held() -> bool {
         .any(|key| unsafe { GetAsyncKeyState(*key as i32) < 0 })
 }
 
+fn service_thread_messages() {
+    let mut message = MSG::default();
+    unsafe {
+        // PeekMessage also delivers synchronous clipboard owner notifications.
+        while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+
 struct ClipboardWindow(HWND);
 
 impl ClipboardWindow {
@@ -272,6 +284,7 @@ impl Clipboard {
             if Instant::now() >= deadline {
                 return Err("The clipboard is busy. Try again.".into());
             }
+            service_thread_messages();
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -550,6 +563,7 @@ fn capture_selection(owner: HWND, source: HWND, stop: &AtomicBool) -> Result<Str
             if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
                 return Err("No selected text was copied before the capture timeout.".into());
             }
+            service_thread_messages();
             thread::sleep(Duration::from_millis(10));
         }
         let _clipboard = Clipboard::open(owner)?;
