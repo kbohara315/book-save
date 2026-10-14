@@ -56,7 +56,7 @@ Cooper temporarily sends **Ctrl+C** to the foreground app and reads fresh Unicod
 - A copied GDI bitmap for `CF_BITMAP` and `CF_DSPBITMAP`.
 - A copied logical palette for `CF_PALETTE`.
 
-Each format must be nonempty and at most 16 MiB. Owner-display, pen data, metafile formats, reserved formats, and private handle formats cause a visible refusal before the clipboard changes. Data that exceeds the limit or cannot be copied safely also causes a refusal. Copy plain text or clear the clipboard before retrying after a refusal. This coverage describes the implementation. Physical shortcut and runtime verification of the expanded format support remain pending.
+Each format must be nonempty and at most 16 MiB. Owner-display, pen data, metafile formats, reserved formats, and private handle formats cause a visible refusal before the clipboard changes. Data that exceeds the limit or cannot be copied safely also causes a refusal. Copy plain text or clear the clipboard before retrying after a refusal.
 
 If another process takes ownership of the clipboard during capture, Cooper cancels and leaves that process's clipboard alone. Clipboard access or restoration can fail if another app holds the clipboard. These failures appear in the app. Clipboard history and clipboard managers may observe the temporary copy. An app that completes its copy after the timeout can still change the clipboard later.
 
@@ -68,6 +68,12 @@ The app saves a JSON array to `data\captures.json` inside this project. Each cap
 
 If the file cannot load, the app displays the error and disables mutations to protect the existing file. Repair the file and restart. Run one app process at a time. This prototype has no file locking or multi-process merge behavior.
 
-The prototype has no tray, image import, sections, sync, or performance measurements. **Ctrl+N** and **Ctrl+F** apply only while its window is focused. No automated tests were added.
+The prototype has no tray, image import, sections, sync, or performance measurements. **Ctrl+N** and **Ctrl+F** apply only while its window is focused.
+
+## Verify Windows clipboard capture
+
+Run `.\verify-clipboard.ps1` to check the production capture code against a separate native editor with selected Unicode text. The check preserves the current clipboard, exercises image, palette, text, rich-text, and file-list formats, and compares the restored bytes and pixels. It also checks unsupported-format refusal, no-selection restoration, injected-key rejection, and repeated capture for GDI handle leaks. A temporary editor window appears during the check. Results are saved to `.local\clipboard-verification.txt`.
+
+Run `.\verify-clipboard.ps1 -ScanOnly` to list formats and check backup without changing the clipboard. The verification crate includes the production Windows module directly. It adds no dependency to the shipped app. These checks exercise actual Windows copying and restoration. They do not generate physical keyboard events.
 
 Read [VERIFICATION.md](VERIFICATION.md) for commands, observed results, and remaining limits. The native workflow ran successfully, including save and reload. One relaunch exited unexpectedly without a diagnostic. Two later relaunches worked. Treat the runtime anomaly as unresolved.

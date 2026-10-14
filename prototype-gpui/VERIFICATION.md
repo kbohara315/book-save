@@ -1,5 +1,19 @@
 # Prototype verification
 
+## Clipboard capture regression, 2026-10-15
+
+The user's repeated failures progressed through HTML Format, `CF_BITMAP` (2), and `CF_DIB` (8). The read-only verification tool reproduced the last error on the actual Windows clipboard. Its eight formats included `CF_BITMAP`, PNG, `CF_DIB`, and `CF_DIBV5`. Supporting one representation left another representation of the same image unsupported.
+
+The fix groups supported formats by their Windows storage type. A single match selects HGLOBAL byte copying, GDI bitmap copying, or logical palette copying. DIB, DIBV5, file lists, and the other documented memory formats now use the existing bounded memory path. Unsupported owner-managed formats still fail before any copy command.
+
+The native editor check also exposed two runtime bugs. `CloseClipboard` synthesized text formats and advanced the marker sequence from 278 to 281. Sampling the sequence after close prevents that change from masquerading as a source copy. The clipboard owner thread also needed to process Windows messages while idle and during clipboard waits. Without message processing, the external editor held the clipboard while waiting for an ownership notification, and capture timed out.
+
+Run `.\verify-clipboard.ps1` for the repeatable integration check. It compiles the production Windows module into a separate tool and copies selected Unicode text from a native editor in a different process. The original clipboard is backed up before fixtures and restored afterward. Comparisons cover the complete format set, raw memory bytes, bitmap dimensions and pixels, and palette entries. Output is saved at `.local\clipboard-verification.txt`.
+
+The checks cover the actual user clipboard, plain text, HTML and RTF, bitmap, DIB, DIBV5, indexed DIB with a palette, file lists, and other standard memory formats. They also check no-selection restoration, unsupported private-format refusal without a sequence change, injected Shift rejection by the real global hook, and 20 repeated image captures without GDI object growth. The tool does not emulate a physical keyboard or test GPUI draft rendering. The previous user screenshots demonstrate that the physical gesture reaches the clipboard path; the gesture logic is unchanged by this fix.
+
+The sections below record earlier prototype sessions. Their unverified clipboard claims describe those earlier sessions.
+
 The decision is whether a native GPUI Kit capture field and local card list can support the Cooper workflow. This artifact is throwaway. The user specified the compact dark direction, so no alternative layouts or stack substitutions were built.
 
 ## Prerequisites observed
