@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "cooper-clipboard-verification"
+name = "book-save-verification"
 version = "0.1.0"
 dependencies = [
  "futures",

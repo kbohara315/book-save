@@ -1,21 +1,21 @@
 param(
-    [ValidateSet('run', 'build', 'check', 'fetch')]
+    [ValidateSet('run', 'build', 'release', 'check', 'fetch')]
     [string]$Command = 'run'
 )
 
 $ErrorActionPreference = 'Stop'
-$prototypeRoot = $PSScriptRoot
+$projectRoot = $PSScriptRoot
 $savedEnvironment = @{}
 foreach ($name in @('CARGO_HOME', 'CARGO_TARGET_DIR', 'RUSTUP_HOME', 'TEMP', 'TMP', 'PATH')) {
     $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 try {
-    $env:CARGO_HOME = Join-Path $prototypeRoot '.local\cargo'
-    $env:CARGO_TARGET_DIR = Join-Path $prototypeRoot 'target'
-    $env:TEMP = Join-Path $prototypeRoot '.local\tmp'
+    $env:CARGO_HOME = Join-Path $projectRoot '.local\cargo'
+    $env:CARGO_TARGET_DIR = Join-Path $projectRoot 'target'
+    $env:TEMP = Join-Path $projectRoot '.local\tmp'
     $env:TMP = $env:TEMP
     New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
-    $isolatedRust = Join-Path $prototypeRoot '.local\rustup'
+    $isolatedRust = Join-Path $projectRoot '.local\rustup'
     if (Test-Path (Join-Path $isolatedRust 'toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe')) {
         $env:RUSTUP_HOME = $isolatedRust
     }
@@ -32,13 +32,14 @@ try {
     if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
         throw 'CMake is required. Add CMake to PATH before running this script.'
     }
-    Push-Location $prototypeRoot
+    Push-Location $projectRoot
     try {
         $ErrorActionPreference = 'Continue'
+        $cargoArgs = if ($Command -eq 'release') { @('build', '--release', '--locked') } else { @($Command, '--locked') }
         if ($env:RUSTUP_HOME -eq $isolatedRust) {
-            & rustup run stable-x86_64-pc-windows-msvc cargo $Command --locked 2>&1 | ForEach-Object { "$_" }
+            & rustup run stable-x86_64-pc-windows-msvc cargo @cargoArgs 2>&1 | ForEach-Object { "$_" }
         } else {
-            & cargo $Command --locked 2>&1 | ForEach-Object { "$_" }
+            & cargo @cargoArgs 2>&1 | ForEach-Object { "$_" }
         }
         $result = $LASTEXITCODE
     } finally {

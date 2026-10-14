@@ -658,6 +658,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "book-save"
+version = "0.1.0"
+dependencies = [
+ "embed-resource",
+ "futures",
+ "gpui-kit",
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "bstr"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -957,17 +969,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
 dependencies = [
  "unicode-segmentation",
-]
-
-[[package]]
-name = "cooper-gpui-prototype"
-version = "0.1.0"
-dependencies = [
- "futures",
- "gpui-kit",
- "serde",
- "serde_json",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

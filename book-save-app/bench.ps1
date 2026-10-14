@@ -1,7 +1,7 @@
 param(
     [int]$Runs = 5,
     [int]$IdleSeconds = 12,
-    [string]$ExePath = 'target\release\cooper-gpui-prototype.exe',
+    [string]$ExePath = 'target\release\book-save.exe',
     [string]$OutCsv = '.local\bench-results.csv'
 )
 
@@ -9,10 +9,10 @@ $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $exe = Join-Path $root $ExePath
 if (-not (Test-Path $exe)) { throw "Missing exe: $exe. Build release first." }
-$running = Get-Process cooper-gpui-prototype -ErrorAction SilentlyContinue
-if ($running) { throw 'Close Cooper before benchmarking; the benchmark will not kill an existing app process.' }
+$running = Get-Process book-save -ErrorAction SilentlyContinue
+if ($running) { throw 'Close Book Save before benchmarking; the benchmark will not kill an existing app process.' }
 $exeBytes = (Get-Item $exe).Length
-$dataFile = Join-Path $root 'data\captures.json'
+$dataFile = Join-Path $env:LOCALAPPDATA 'Book Save\captures.json'
 $dataBackup = Join-Path $root '.local\captures.json.bench-backup'
 if (Test-Path $dataFile) { Copy-Item $dataFile $dataBackup -Force }
 $beforeHash = if (Test-Path $dataFile) { (Get-FileHash $dataFile -Algorithm SHA256).Hash } else { 'no-file' }
@@ -71,9 +71,10 @@ for ($i = 1; $i -le $Runs; $i++) {
     }
     try {
         if (-not $p.HasExited) {
-            $p.CloseMainWindow() | Out-Null
-            Start-Sleep -Milliseconds 1500
-            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+            # Closing the window only minimizes it (the capture hook keeps
+            # running), so stop the process directly after each measurement.
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            $p.WaitForExit(5000) | Out-Null
         }
     } catch { }
     $cache = if ($i -eq 1) { 'cold-ish' } else { 'warm' }

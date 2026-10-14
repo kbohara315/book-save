@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use futures::StreamExt;
 use gpui_kit::assets::icon_assets;
 use gpui_kit::component::{
@@ -8,12 +10,17 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 use serde::{Deserialize, Serialize};
-use std::{fs, io::Write, path::PathBuf};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 mod global_capture;
+mod lifecycle;
 use global_capture::{CaptureEvent, CaptureWorker};
 
-actions!(cooper, [FocusCapture, FocusSearch, CancelEdit]);
+actions!(book_save, [FocusCapture, FocusSearch, CancelEdit]);
 
 icon_assets!(AppAssets, [Check, Close]);
 
@@ -47,7 +54,7 @@ struct PersistResult {
     result: Result<(), String>,
 }
 
-fn write_snapshot(path: &PathBuf, snapshot: &[Capture]) -> Result<(), Box<dyn std::error::Error>> {
+fn write_snapshot(path: &Path, snapshot: &[Capture]) -> Result<(), Box<dyn std::error::Error>> {
     let bytes = serde_json::to_vec_pretty(snapshot)?;
     fs::create_dir_all(path.parent().expect("data directory"))?;
     let temporary = path.with_extension("json.tmp");
@@ -57,6 +64,36 @@ fn write_snapshot(path: &PathBuf, snapshot: &[Capture]) -> Result<(), Box<dyn st
     drop(file);
     fs::rename(temporary, path)?;
     Ok(())
+}
+
+fn copy_legacy_data_if_missing(destination: &Path, legacy: &Path) -> std::io::Result<bool> {
+    if destination.exists() || !legacy.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(legacy, destination)?;
+    Ok(true)
+}
+
+fn capture_data_path() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| "Windows did not provide the LOCALAPPDATA folder.".to_owned())?;
+        let path = local_app_data.join("Book Save").join("captures.json");
+        let legacy = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/captures.json");
+        copy_legacy_data_if_missing(&path, &legacy).map_err(|error| {
+            format!("Could not copy the saved list to its user folder: {error}")
+        })?;
+        Ok(path)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/captures.json"))
+    }
 }
 
 struct PersistWorker {
@@ -133,7 +170,7 @@ fn can_deliver_deferred_capture(saving: bool, load_failed: bool, editing: bool) 
     !saving && !load_failed && !editing
 }
 
-struct Cooper {
+struct BookSave {
     items: Vec<Capture>,
     lowered: Vec<String>,
     capture: Entity<InputState>,
@@ -155,15 +192,22 @@ struct Cooper {
     _subscriptions: Vec<Subscription>,
 }
 
-impl Cooper {
+impl BookSave {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/captures.json");
-        let loaded = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<Vec<Capture>>(&bytes).map_err(|e| e.to_string()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(e.to_string()),
-        }
-        .and_then(|items| {
+        let (path, loaded) = match capture_data_path() {
+            Ok(path) => {
+                let loaded = match fs::read(&path) {
+                    Ok(bytes) => {
+                        serde_json::from_slice::<Vec<Capture>>(&bytes).map_err(|e| e.to_string())
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                    Err(e) => Err(e.to_string()),
+                };
+                (path, loaded)
+            }
+            Err(error) => (PathBuf::new(), Err(error)),
+        };
+        let loaded = loaded.and_then(|items| {
             let mut ids = std::collections::HashSet::new();
             if items
                 .iter()
@@ -175,7 +219,7 @@ impl Cooper {
             }
         });
         let load_failed = loaded.is_err();
-        let error = loaded.as_ref().err().map(|e| format!("Cannot load captures. {e} Your file has been left untouched. Repair data/captures.json and restart."));
+        let error = loaded.as_ref().err().map(|e| format!("Cannot load the saved list. {e} Your file has been left untouched. Check %LOCALAPPDATA%\\Book Save\\captures.json and restart."));
         let items = loaded.unwrap_or_default();
         let lowered = lowered_for(&items);
         let status = format!("{} captures loaded", items.len());
@@ -504,7 +548,7 @@ impl Cooper {
     }
 }
 
-impl Render for Cooper {
+impl Render for BookSave {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.search.read(cx).value().to_lowercase();
         let mut visible_idx: Vec<usize> = Vec::new();
@@ -656,7 +700,7 @@ impl Render for Cooper {
             .flex_col()
             .p_4()
             .gap_3()
-            .key_context("Cooper")
+            .key_context("BookSave")
             .on_action(cx.listener(Self::focus_capture))
             .on_action(cx.listener(Self::focus_search))
             .on_action(cx.listener(Self::cancel_edit))
@@ -672,13 +716,24 @@ impl Render for Cooper {
                         div()
                             .text_xl()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("Cooper"),
+                            .child("Book Save"),
                     )
                     .child(
                         div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{open} open")),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{open} open")),
+                            )
+                            .child(Button::new("quit").ghost().small().label("Quit").on_click(
+                                cx.listener(|_, _, window, _| {
+                                    window.remove_window();
+                                }),
+                            )),
                     ),
             )
             .child(
@@ -735,19 +790,24 @@ impl Render for Cooper {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Ctrl+N capture · Ctrl+F search"),
+                    .child("Ctrl+N capture · Ctrl+F search · Closing minimizes, Quit exits"),
             )
     }
 }
 
 fn main() {
-    application().with_assets(AppAssets).run(|cx| {
+    #[cfg(windows)]
+    if lifecycle::handover_to_running_instance() {
+        return;
+    }
+    let background = lifecycle::background_launch_requested();
+    application().with_assets(AppAssets).run(move |cx| {
         init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         cx.bind_keys([
-            KeyBinding::new("ctrl-n", FocusCapture, Some("Cooper")),
-            KeyBinding::new("ctrl-f", FocusSearch, Some("Cooper")),
-            KeyBinding::new("escape", CancelEdit, Some("Cooper")),
+            KeyBinding::new("ctrl-n", FocusCapture, Some("BookSave")),
+            KeyBinding::new("ctrl-f", FocusSearch, Some("BookSave")),
+            KeyBinding::new("escape", CancelEdit, Some("BookSave")),
         ]);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
@@ -760,15 +820,24 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(420.), px(460.))),
+                show: !background,
+                focus: !background,
                 ..Default::default()
             },
             cx,
             |window, cx| {
-                window.set_window_title("Cooper capture prototype");
-                cx.new(|cx| Cooper::new(window, cx))
+                window.set_window_title("Book Save");
+                window.on_window_should_close(cx, |window, _| {
+                    // Keep the process (and its global capture hook) alive.
+                    // The taskbar button reopens the minimized window, and a
+                    // later launch from the Start menu reveals it as well.
+                    window.minimize_window();
+                    false
+                });
+                cx.new(|cx| BookSave::new(window, cx))
             },
         )
-        .expect("open Cooper window");
+        .expect("open Book Save window");
         cx.activate(true);
     });
 }
@@ -777,7 +846,8 @@ fn main() {
 mod perf_tests {
     use super::{
         Capture, Filter, PersistRequest, PersistWorker, can_deliver_deferred_capture,
-        filter_matches, lowered_for, write_snapshot,
+        copy_legacy_data_if_missing, filter_matches, lifecycle::is_background_arg, lowered_for,
+        write_snapshot,
     };
     use std::collections::HashSet;
 
@@ -785,7 +855,7 @@ mod perf_tests {
         vec![
             Capture {
                 id: 2,
-                text: "Plan the Cooper capture PANEL".into(),
+                text: "Plan the Book Save capture PANEL".into(),
                 complete: true,
             },
             Capture {
@@ -866,7 +936,7 @@ mod perf_tests {
     #[test]
     fn persist_bytes_match_pretty_schema_and_roundtrip() {
         let dir = std::env::temp_dir().join(format!(
-            "cooper-perf-test-{}",
+            "book-save-perf-test-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -892,9 +962,33 @@ mod perf_tests {
     }
 
     #[test]
+    fn legacy_data_copies_once_and_never_replaces_newer_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "book-save-migration-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let legacy = dir.join("old").join("captures.json");
+        let destination = dir.join("user").join("Book Save").join("captures.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"legacy list").unwrap();
+
+        assert!(copy_legacy_data_if_missing(&destination, &legacy).unwrap());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"legacy list");
+        std::fs::write(&destination, b"newer list").unwrap();
+        assert!(!copy_legacy_data_if_missing(&destination, &legacy).unwrap());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"newer list");
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"legacy list");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn persist_replacement_is_atomic_no_tmp_left() {
         let dir = std::env::temp_dir().join(format!(
-            "cooper-perf-atomic-{}",
+            "book-save-perf-atomic-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -948,7 +1042,7 @@ mod perf_tests {
     #[test]
     fn persist_queue_is_fifo_ordered() {
         let dir = std::env::temp_dir().join(format!(
-            "cooper-perf-fifo-{}",
+            "book-save-perf-fifo-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -984,6 +1078,15 @@ mod perf_tests {
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(bytes, serde_json::to_vec_pretty(&second).unwrap());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn background_flag_matches_only_double_dash_background() {
+        assert!(is_background_arg("--background"));
+        assert!(!is_background_arg("--minimized"));
+        assert!(!is_background_arg("--Background"));
+        assert!(!is_background_arg(""));
+        assert!(!is_background_arg("background"));
     }
 
     #[test]

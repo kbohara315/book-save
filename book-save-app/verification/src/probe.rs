@@ -52,7 +52,7 @@ pub fn run_probe() -> Result<(), String> {
     Ok(())
 }
 
-const EXPECTED_SELECTION: &str = "Cooper selected text: café नमस्ते 😀";
+const EXPECTED_SELECTION: &str = "Book Save selected text: café नमस्ते 😀";
 
 fn source_window(handle_path: &str) -> Result<(), String> {
     let class: Vec<u16> = "EDIT\0".encode_utf16().collect();
@@ -105,7 +105,7 @@ impl SourceProcess {
         use std::os::windows::process::CommandExt;
         let previous_foreground = unsafe { GetForegroundWindow() };
         let handle_path =
-            std::env::temp_dir().join(format!("cooper-verify-{}.hwnd", std::process::id()));
+            std::env::temp_dir().join(format!("book-save-verify-{}.hwnd", std::process::id()));
         let _ = std::fs::remove_file(&handle_path);
         let process =
             std::process::Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
@@ -423,7 +423,7 @@ fn set_fixture(owner: HWND, name: &str) -> Result<(), String> {
             let mut bytes = vec![0u8; 20];
             bytes[0..4].copy_from_slice(&20u32.to_le_bytes());
             bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
-            bytes.extend(text_bytes("C:\\Cooper verification\\fixture.txt\0"));
+            bytes.extend(text_bytes("C:\\Book Save verification\\fixture.txt\0"));
             ClipboardData::from_bytes(&bytes)?.put(15)?;
         }
         "standard memory formats" => {
