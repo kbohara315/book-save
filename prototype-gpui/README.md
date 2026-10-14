@@ -40,12 +40,28 @@ The launcher keeps Cargo downloads, temporary build files, and build output unde
 
 **Ctrl+N** focuses the capture field. **Ctrl+F** focuses search. Adding a capture clears the search and selects **All** so the new card is visible. Editing preserves the current filter and search.
 
+## Capture selected text on Windows
+
+1. Leave Cooper running and select text in another app that supports **Ctrl+C**.
+2. Press and release **Left Shift** twice. The two key-down events must be at most 350 milliseconds apart. Release the second press promptly.
+3. Cooper fills its capture field and requests window activation. Review the text, then press **Enter** or click **Add** to save.
+
+The capture replaces the current unsaved capture draft. An active edit or a load error blocks delivery and leaves the existing field untouched. Capture failures appear below the list. No text is saved automatically.
+
+The shortcut ignores key repeats, injected input, Right Shift, and gestures with another modifier held. Another key press cancels the pending tap. Captures do not overlap. UI automation sends injected keystrokes, so it cannot prove that the physical gesture works.
+
+Cooper temporarily sends **Ctrl+C** to the foreground app and reads fresh Unicode clipboard text. It waits up to 800 milliseconds for a copy. It restores the original clipboard after success or an unusable selection. An empty clipboard and standard text formats are supported, including ANSI text, OEM text, Unicode text, and locale data. Each format is limited to 16 MiB. Images, files, HTML, rich text, and unknown formats cause a visible refusal before the clipboard changes. Copy plain text or clear the clipboard before retrying.
+
+If another process takes ownership of the clipboard during capture, Cooper cancels and leaves that process's clipboard alone. Clipboard access or restoration can fail if another app holds the clipboard. These failures appear in the app. Clipboard history and clipboard managers may observe the temporary copy. An app that completes its copy after the timeout can still change the clipboard later.
+
+This is a Windows desktop hook, not a registered system hotkey. The source app must support copying selected text as Unicode with **Ctrl+C**. Some editors copy a whole line when no text is selected. Elevated apps, secure desktops, unusual clipboard owners, and apps with custom copy commands may not work. Windows can silently remove a hook that times out. Cooper releases the hook and joins both OS threads on normal shutdown. Other platforms use a no-op worker and show an unsupported message while retaining manual capture.
+
 ## Keep the data local
 
 The app saves a JSON array to `data\captures.json` inside this project. Each capture has `id`, `text`, and `complete`. Every mutation writes a temporary file, flushes it, and replaces the previous JSON file before updating the list. A failed save leaves the draft and previous list available.
 
 If the file cannot load, the app displays the error and disables mutations to protect the existing file. Repair the file and restart. Run one app process at a time. This prototype has no file locking or multi-process merge behavior.
 
-The prototype has no global shortcuts, system-wide capture, tray, image import, sections, sync, or performance measurements. Its keyboard shortcuts apply only while its window is focused. No tests were added.
+The prototype has no tray, image import, sections, sync, or performance measurements. **Ctrl+N** and **Ctrl+F** apply only while its window is focused. No automated tests were added.
 
 Read [VERIFICATION.md](VERIFICATION.md) for commands, observed results, and remaining limits. The native workflow ran successfully, including save and reload. One relaunch exited unexpectedly without a diagnostic. Two later relaunches worked. Treat the runtime anomaly as unresolved.

@@ -89,7 +89,7 @@ The first relaunch exited with `0xffffffff` and no diagnostic beyond Cargo's exi
 
 Windows UI Automation exposed editable fields, buttons, and checkboxes. It reported the focused element as the root region, even while the input showed a caret and accepted typing. Card text did not appear in that tree. Screen reader support is not verified.
 
-No automated tests, large-list stress checks, save-failure simulations, or performance measurements were run. Global capture and tray behavior are outside the prototype scope.
+No automated tests, large-list stress checks, save-failure simulations, or performance measurements were run during the original prototype session. Tray behavior remains outside the prototype scope. Global capture verification is recorded separately below.
 
 The observed workflow supports continuing a GPUI Kit evaluation for this capture panel. Investigate the unexplained relaunch exit and accessibility limitations before making a production decision.
 
@@ -104,3 +104,69 @@ One GPUI entity owns the capture list and retained input states. The composer us
 The verification distinguishes a successful build from observed GUI behavior. This applies the Prove It Works principle.
 
 The implementation delegate worked in-thread because the workspace was empty, the prototype was small, and the user required one isolated directory. No production architecture, git repository, PR, or tests were created.
+
+## Windows global capture implementation
+
+This change starts from `5e68e67` in the isolated worktree at `C:\Users\ACER\.t3\worktrees\book-save\t3-ea2f0239`. The earlier interaction results above describe the original prototype, not verification of this change.
+
+`CaptureEvent` carries readiness, selected Unicode text, or a visible failure from the OS worker. GPUI polls the channel every 50 milliseconds in a retained UI-runtime task. Selected text fills the existing input without saving. An edit or load error prevents delivery. Persistence and CRUD methods keep their existing behavior.
+
+The two candidate OS designs were a `WH_KEYBOARD_LL` callback on a dedicated message-loop thread and raw input through a hidden window. The callback was chosen for the explicit injected-input flags and the small integration boundary. It only detects taps and queues a request. A separate clipboard worker owns the temporary clipboard transaction. Raw input would require device registration and another window procedure. Microsoft recommends raw input for general asynchronous monitoring, but this feature needs the hook's explicit injected-input distinction. See [LowLevelKeyboardProc](https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelkeyboardproc).
+
+The hook uses `ShiftGesture` to track released, pressed, and triggered states. It recognizes distinct Left Shift key-down events at most 350 milliseconds apart and queues the copy on the second key-up. This avoids racing the asynchronous Shift state update. Repeats and injected events do not advance the gesture. Other physical key-down events cancel the pending tap. Other held modifiers block the pair. Requests do not overlap.
+
+Before changing the clipboard, the worker duplicates every supported format into owned movable memory. It supports an empty clipboard and `CF_TEXT`, `CF_OEMTEXT`, `CF_UNICODETEXT`, and `CF_LOCALE`, with a 16 MiB limit per format. Other formats cause a refusal before any copy command. The worker uses a message-only owner window, since clipboard restoration needs a valid owner. See [SetClipboardData](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setclipboarddata).
+
+An empty Unicode marker separates a fresh copy from stale clipboard text. The worker waits up to 800 milliseconds for a changed clipboard sequence and accepts Unicode text only from a clipboard owner in the source process. It restores the original formats after success or no usable selection. A changed sequence after reading cancels restoration, preserving the newer clipboard. Clipboard contention or failed restoration produces an error. Clipboard history may retain the temporary contents. A source app that copies after the timeout may replace the clipboard later.
+
+Normal app quit stops the worker, posts `WM_QUIT`, explicitly unhooks, and joins the hook and clipboard threads. Dropping the worker also stops it. Non-Windows builds select a no-op worker that reports unsupported global capture. A non-Windows target was not available on this machine, so cross-platform compilation was not run.
+
+The implementation throughput checkpoint was:
+
+- Blocking first steps were the full agent instructions, existing UI and persistence reads, and the OS ownership sketch.
+- Independent workstreams were not used because this is one feature with one implementation owner.
+- Shared mutable state stays inside one clipboard worker. The callback owns its tap state, and GPUI receives owned events through a channel.
+- The smallest safe decomposition is one Windows module and one cross-platform event boundary. Broader review belongs to the coordinating parent.
+
+Model the Domain shaped the `CaptureEvent` enum and the single owner for each kind of state. Prove It Works requires separate evidence for compilation, real UI behavior, and a physical gesture. No automated tests were added.
+
+### Physical checks still required
+
+Use a real keyboard with a source app such as Notepad and an empty or plain-text clipboard. These checks have not been run by the implementation delegate:
+
+1. Select Unicode text in the source app, double-tap Left Shift within 350 milliseconds, and release. Confirm one draft arrives, nothing saves automatically, and the original clipboard returns.
+2. Try no selection, whitespace-only text, a held Shift, Right Shift, key repeats, another modifier held, three rapid taps, and a pair more than 350 milliseconds apart. Confirm only a valid pair captures once. Account for editors that copy a whole line without a selection.
+3. Put an image or rich text on the clipboard. Confirm capture refuses without changing the clipboard. Try clipboard contention and a source app running elevated.
+4. Capture while editing a card. Confirm the edit remains intact. Close Cooper during a pending capture and confirm the process exits and subsequent taps do nothing.
+
+An injected-input check can verify rejection. It is not evidence of physical gesture success or of successful clipboard rollback.
+
+### Results from this implementation session
+
+Verification ran on Windows with the isolated Rust 1.99 stable toolchain. Cargo used the existing dependency cache at `C:\Users\ACER\Documents\Endeavor\hobby\book-save\prototype-gpui\.local\cargo`. Build output stayed in this worktree's `prototype-gpui\target`. CMake came from the Visual Studio 2022 Community directory documented above.
+
+These commands completed successfully in this worktree's `prototype-gpui` directory:
+
+```powershell
+rustup run stable cargo check --offline
+rustup run stable cargo build --locked --offline
+& 'C:\Users\ACER\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustfmt.exe' --check --edition 2024 src/main.rs src/global_capture.rs src/global_capture_windows.rs
+git diff --check
+& '.\target\debug\cooper-gpui-prototype.exe'
+```
+
+`CARGO_HOME` and `RUSTUP_HOME` pointed to the existing prototype's `.local\cargo` and `.local\rustup` for the Cargo commands. The build passed again after the key-up handoff change. The isolated toolchain lacked rustfmt, so formatting used the existing installed rustfmt executable shown above.
+
+Computer Use drove the actual built executable with injected input. The observed results were:
+
+- Startup displayed `Select text in another app, then double-tap Left Shift.` This confirms that hook installation reported success and the typed readiness event reached GPUI. It does not prove physical gesture detection.
+- Two injected Left Shift calls completed within 115 milliseconds. The capture field stayed empty and the ready status remained unchanged. This is a negative injected-input check in Cooper itself, not a selected-text capture from another app.
+- Enter saved `Windows capture smoke check`. The card appeared, and the JSON contained that text with `complete: false`.
+- Edit and Save changed the text to `Windows capture smoke check edited`. The JSON matched the displayed card.
+- Completing the card changed the JSON to `complete: true`. Closing with Alt+F4 exited with code 0.
+- Restart restored the edited text and completed state. Delete removed this session's demonstration card, and the JSON became `[]`.
+- The second Alt+F4 shutdown also exited with code 0. A process query found no remaining `cooper-gpui-prototype` process.
+
+The observed running window is saved at [.local/global-capture-window.png](.local/global-capture-window.png). Its accessibility tree is saved at [.local/global-capture-accessibility.txt](.local/global-capture-accessibility.txt). These files and the empty demonstration data file are untracked verification artifacts in this worktree. The first screenshot returned background content before activation. Explicit activation returned the actual Cooper window. This screenshot anomaly does not establish an app crash.
+
+Physical gesture success, successful OS selection capture, clipboard restoration, clipboard failure paths, and shutdown during an active copy remain unverified. Filters, search, edit cancellation, accessibility support, and other platforms were not rechecked in this session. No automated tests were added or run. A narrow delegated comment audit reported zero comments to delete and no suppression attributes. The coordinating parent owns broader correctness review.

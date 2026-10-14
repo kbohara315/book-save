@@ -8,6 +8,9 @@ use gpui_kit::*;
 use serde::{Deserialize, Serialize};
 use std::{fs, io::Write, path::PathBuf};
 
+mod global_capture;
+use global_capture::{CaptureEvent, CaptureWorker};
+
 actions!(cooper, [FocusCapture, FocusSearch, CancelEdit]);
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -39,6 +42,9 @@ struct Cooper {
     load_failed: bool,
     error: Option<String>,
     status: String,
+    capture_status: String,
+    capture_worker: CaptureWorker,
+    _capture_events: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -78,6 +84,31 @@ impl Cooper {
             }
         });
         capture.update(cx, |input, cx| input.focus(window, cx));
+        let (capture_worker, events) = global_capture::start();
+        let capture_events = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                while let Ok(event) = events.try_recv() {
+                    if this
+                        .update_in(cx, |this, window, cx| {
+                            this.receive_capture(event, window, cx);
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                if this.upgrade().is_none() {
+                    return;
+                }
+            }
+        });
+        let shutdown = cx.on_app_quit(|this, _| {
+            this.capture_worker.stop();
+            async {}
+        });
         Self {
             items,
             capture,
@@ -88,8 +119,35 @@ impl Cooper {
             load_failed,
             error,
             status,
-            _subscriptions: vec![submit, query],
+            capture_status: "Starting global capture...".into(),
+            capture_worker,
+            _capture_events: capture_events,
+            _subscriptions: vec![submit, query, shutdown],
         }
+    }
+
+    fn receive_capture(
+        &mut self,
+        event: CaptureEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.capture_status = match event {
+            CaptureEvent::Ready => "Select text in another app, then double-tap Left Shift.".into(),
+            CaptureEvent::Failed(error) => format!("Global capture failed. {error}"),
+            CaptureEvent::SelectedText(_) if self.load_failed || matches!(self.composer, Composer::Edit { .. }) => {
+                "Global capture skipped. Finish or cancel your edit and resolve any load error first.".into()
+            }
+            CaptureEvent::SelectedText(text) => {
+                self.capture.update(cx, |input, cx| {
+                    input.set_value(text, window, cx);
+                    input.focus(window, cx);
+                });
+                window.activate_window();
+                "Selected text is ready. Press Enter or Add to save.".into()
+            }
+        };
+        cx.notify();
     }
 
     fn persist(&mut self, items: Vec<Capture>, message: &str, cx: &mut Context<Self>) -> bool {
@@ -428,6 +486,12 @@ impl Render for Cooper {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(self.status.clone()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(self.capture_status.clone()),
             )
             .child(
                 div()
