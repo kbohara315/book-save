@@ -497,8 +497,8 @@ fn capture_selection(owner: HWND, source: HWND, stop: &AtomicBool) -> Result<Str
         return Err("Cannot prepare the clipboard. Clipboard left untouched.".into());
     }
     let prepared = marker.put(UNICODE_TEXT);
-    let marker_sequence = unsafe { GetClipboardSequenceNumber() };
     drop(clipboard);
+    let marker_sequence = unsafe { GetClipboardSequenceNumber() };
 
     let mut restore_sequence = marker_sequence;
     let result = prepared.and_then(|_| {
