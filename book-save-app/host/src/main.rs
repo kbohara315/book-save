@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 //! Resident host entry point: owns the tray, the global capture hook and the
 //! single-instance control pipe, and spawns the GPUI UI on demand.
 //!

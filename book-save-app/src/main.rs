@@ -23,7 +23,7 @@ use std::{
 mod session;
 use session::Session;
 
-actions!(book_save, [FocusCapture, FocusSearch, CancelEdit]);
+actions!(book_save, [FocusCapture, FocusSearch, CancelEdit, CloseWindow]);
 
 icon_assets!(AppAssets, [Check, Close]);
 
@@ -753,6 +753,10 @@ impl BookSave {
     fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
         self.search.update(cx, |input, cx| input.focus(window, cx));
     }
+
+    fn close_window(&mut self, _: &CloseWindow, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.quit();
+    }
 }
 
 impl Render for BookSave {
@@ -911,6 +915,7 @@ impl Render for BookSave {
             .on_action(cx.listener(Self::focus_capture))
             .on_action(cx.listener(Self::focus_search))
             .on_action(cx.listener(Self::cancel_edit))
+            .on_action(cx.listener(Self::close_window))
             .font_family("Segoe UI")
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
@@ -988,7 +993,7 @@ impl Render for BookSave {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Ctrl+N capture · Ctrl+F search · Closing this window keeps Book Save in the tray"),
+                    .child("Ctrl+N capture · Ctrl+F search · Ctrl+Q close · Closing this window keeps Book Save in the tray"),
             )
     }
 }
@@ -1021,6 +1026,7 @@ fn main() {
             KeyBinding::new("ctrl-n", FocusCapture, Some("BookSave")),
             KeyBinding::new("ctrl-f", FocusSearch, Some("BookSave")),
             KeyBinding::new("escape", CancelEdit, Some("BookSave")),
+            KeyBinding::new("ctrl-q", CloseWindow, Some("BookSave")),
         ]);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
