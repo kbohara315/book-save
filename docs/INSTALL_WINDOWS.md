@@ -13,9 +13,9 @@ Book Save installs for one Windows user. It does not need administrator access.
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
    ```
 
-The installer copies the app to `%LOCALAPPDATA%\Programs\Book Save`. It adds **Book Save** to the Start menu. It also adds **Book Save Background** to your personal Startup folder, so global capture keeps working after sign-in. Open it from the Start menu to run the app. The app shows a **BS** monogram icon in the Start menu, taskbar, and Startup shortcuts.
+The installer copies the app to `%LOCALAPPDATA%\Programs\Book Save`. It adds **Book Save** to the Start menu. It also adds **Book Save Background** to your personal Startup folder, so global capture keeps working after sign-in. Open it from the Start menu to run the app. The app shows a **BS** monogram icon in the Start menu, tray, and Startup shortcuts.
 
-If Book Save is already running, the installer refuses to continue instead of closing the app for you. Open Book Save from the Start menu (or its taskbar button) and select **Quit** in the app header so any pending save can finish, then run the installer again.
+If Book Save is already running, the installer refuses to continue instead of closing the app for you. Open the tray menu and select **Exit**. Wait for Book Save to close, then run the installer again.
 
 ## Install from the source folder
 
@@ -42,9 +42,10 @@ The zip is written to `book-save-app\dist\Book-Save-Windows-x64.zip`.
 The global keyboard hook only works while Book Save runs, so the app stays running after you close its window:
 
 - Opening Book Save from the Start menu shows its window. No terminal window opens.
-- Book Save starts automatically without a visible window each time you sign in, so double-tapping Left Shift captures selected text even when you have not opened the window.
-- Closing the window minimizes it to the taskbar instead of quitting, so capture keeps working. Select the taskbar button, or open Book Save from the Start menu again, to bring the window back. A second launch never starts a second copy; it reveals the running window.
-- To quit Book Save completely, select **Quit** in the app header. Quitting stops global capture until you open the app again or sign in again.
+- Book Save starts hidden each time you sign in. Double-tap Left Shift to capture selected text.
+- Closing the window hides it from the taskbar. Use the tray menu to select **Open Book Save**. A second launch reveals the same window and does not start another copy.
+- Book Save opens after capture. Review the selected text, then press **Enter** or select **Add** to save it.
+- To stop capture, select **Exit** in the tray menu. Pending saves finish before Book Save closes.
 
 ## Saved list
 
@@ -60,7 +61,7 @@ Back up `captures.json` if you need another copy. Book Save does not sync your l
 
 ## Remove Book Save
 
-The uninstaller refuses to run while the app is still running. Open Book Save and select **Quit** in the app header so any pending save can finish, then run the uninstaller again. Open the folder that contains `uninstall.ps1` and run:
+The uninstaller refuses to run while the app is still running. Select **Exit** in the tray menu. Wait for Book Save to close, then run the uninstaller. Open the folder that contains `uninstall.ps1` and run:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1

@@ -35,9 +35,11 @@ try {
     Push-Location $projectRoot
     try {
         $ErrorActionPreference = 'Continue'
-        $cargoArgs = if ($Command -eq 'release') { @('build', '--release', '--locked') } else { @($Command, '--locked') }
-        if ($env:RUSTUP_HOME -eq $isolatedRust) {
-            & rustup run stable-x86_64-pc-windows-msvc cargo @cargoArgs 2>&1 | ForEach-Object { "$_" }
+        $cargoArgs = if ($Command -eq 'release') { @('build', '--release', '--locked', '--workspace') } elseif ($Command -in @('build', 'check')) { @($Command, '--locked', '--workspace') } else { @($Command, '--locked') }
+        $isolatedCargo = Join-Path $isolatedRust 'toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe'
+        if (Test-Path -LiteralPath $isolatedCargo) {
+            $env:PATH = (Split-Path $isolatedCargo) + ';' + $env:PATH
+            & $isolatedCargo @cargoArgs 2>&1 | ForEach-Object { "$_" }
         } else {
             & cargo @cargoArgs 2>&1 | ForEach-Object { "$_" }
         }

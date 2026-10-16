@@ -9,7 +9,7 @@ pub enum CaptureEvent {
 }
 
 #[cfg(windows)]
-#[path = "global_capture_windows.rs"]
+#[path = "capture_windows.rs"]
 mod platform;
 #[cfg(windows)]
 pub use platform::CaptureWorker;

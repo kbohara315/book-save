@@ -5,7 +5,7 @@ pub enum CaptureEvent {
 }
 
 mod platform {
-    include!("../../src/global_capture_windows.rs");
+    include!("../../host/src/capture_windows.rs");
     include!("probe.rs");
 }
 

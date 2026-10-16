@@ -1,5 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+use book_save_host::ipc::PipeClient;
+use book_save_host::{ClientMessage, Role, ServerMessage};
 use futures::StreamExt;
 use gpui_kit::assets::icon_assets;
 use gpui_kit::component::{
@@ -14,11 +16,12 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 
-mod global_capture;
-mod lifecycle;
-use global_capture::{CaptureEvent, CaptureWorker};
+mod session;
+use session::Session;
 
 actions!(book_save, [FocusCapture, FocusSearch, CancelEdit]);
 
@@ -95,6 +98,82 @@ fn capture_data_path() -> Result<PathBuf, String> {
         Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/captures.json"))
     }
 }
+
+/// Live connection to the resident host plus the stream of inbound messages.
+struct HostLink {
+    outgoing: std::sync::mpsc::SyncSender<ClientMessage>,
+    incoming: futures::channel::mpsc::UnboundedReceiver<ServerMessage>,
+}
+
+/// Connect to the resident host, starting a background host when none is up.
+fn connect_host() -> Result<HostLink, String> {
+    let client = Arc::new(connect_with_spawn()?);
+    let (outgoing, outbound) = std::sync::mpsc::sync_channel::<ClientMessage>(32);
+    let writer = client.clone();
+    std::thread::spawn(move || {
+        while let Ok(message) = outbound.recv() {
+            if let Err(error) = writer.send(&message) {
+                eprintln!("Book Save host connection lost: {error}");
+                break;
+            }
+        }
+    });
+    outgoing
+        .try_send(ClientMessage::Hello {
+            role: Role::Ui,
+            pid: std::process::id(),
+        })
+        .map_err(|error| error.to_string())?;
+    let (sender, incoming) = futures::channel::mpsc::unbounded();
+    let reader = client.clone();
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        loop {
+            match reader.recv(&mut buffer) {
+                Ok(Some(message)) => {
+                    if sender.unbounded_send(message).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+    });
+    Ok(HostLink { outgoing, incoming })
+}
+
+fn connect_with_spawn() -> Result<PipeClient, String> {
+    if let Some(client) = PipeClient::connect() {
+        return Ok(client);
+    }
+    spawn_host();
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(150));
+        if let Some(client) = PipeClient::connect() {
+            return Ok(client);
+        }
+    }
+    Err("Book Save could not reach its background host.".into())
+}
+
+#[cfg(windows)]
+fn spawn_host() {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(directory) = exe.parent() {
+            let host = directory.join("book-save.exe");
+            let _ = std::process::Command::new(host)
+                .arg("--background")
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn spawn_host() {}
 
 struct PersistWorker {
     tx: Option<std::sync::mpsc::Sender<PersistRequest>>,
@@ -182,18 +261,24 @@ struct BookSave {
     error: Option<String>,
     status: String,
     capture_status: String,
-    capture_worker: CaptureWorker,
+    host: Option<std::sync::mpsc::SyncSender<ClientMessage>>,
     persist_worker: PersistWorker,
     persist_next_seq: u64,
     pending: Option<PendingSave>,
     deferred_capture: Option<String>,
-    _capture_events: Task<()>,
+    capture_cache: String,
+    _host_events: Option<Task<()>>,
     _persist_events: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl BookSave {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        host_link: Option<HostLink>,
+        host_error: Option<String>,
+    ) -> Self {
         let (path, loaded) = match capture_data_path() {
             Ok(path) => {
                 let loaded = match fs::read(&path) {
@@ -219,7 +304,11 @@ impl BookSave {
             }
         });
         let load_failed = loaded.is_err();
-        let error = loaded.as_ref().err().map(|e| format!("Cannot load the saved list. {e} Your file has been left untouched. Check %LOCALAPPDATA%\\Book Save\\captures.json and restart."));
+        let error = loaded
+            .as_ref()
+            .err()
+            .map(|e| format!("Cannot load the saved list. {e} Your file has been left untouched. Check %LOCALAPPDATA%\\Book Save\\captures.json and restart."))
+            .or(host_error);
         let items = loaded.unwrap_or_default();
         let lowered = lowered_for(&items);
         let status = format!("{} captures loaded", items.len());
@@ -230,26 +319,43 @@ impl BookSave {
                 cx.defer_in(window, |this, window, cx| this.submit(window, cx));
             }
         });
+        let drafted = cx.subscribe_in(&capture, window, |this, _, event, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.capture_cache = this.capture.read(cx).value().to_string();
+                this.persist_session();
+                cx.notify();
+            }
+        });
         let query = cx.subscribe_in(&search, window, |_, _, event, _, cx| {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
             }
         });
-        capture.update(cx, |input, cx| input.focus(window, cx));
-        let (capture_worker, events) = global_capture::start();
-        let capture_events = cx.spawn_in(window, async move |this, cx| {
-            let mut events = events;
-            while let Some(event) = events.next().await {
-                if this
-                    .update_in(cx, |this, window, cx| {
-                        this.receive_capture(event, window, cx);
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+
+        let restored = Session::load();
+        if let Err(error) = restored.save() {
+            eprintln!("Book Save session save failed: {error}");
+        }
+        let mut composer = Composer::Capture;
+        let mut deferred_capture = None;
+        let mut initial_text = restored.capture_draft.clone();
+        if let Some(target) = restored.edit_target {
+            if items.iter().any(|item| item.id == target) {
+                composer = Composer::Edit {
+                    id: target,
+                    capture_draft: restored.capture_draft_before_edit.clone(),
+                };
+                initial_text = restored.edit_draft.clone();
             }
+        }
+        if restored.deferred_capture.is_some() {
+            deferred_capture = restored.deferred_capture;
+        }
+        capture.update(cx, |input, cx| {
+            input.set_value(initial_text.clone(), window, cx);
+            input.focus(window, cx);
         });
+
         let (persist_tx, persist_rx) = futures::channel::mpsc::unbounded::<PersistResult>();
         let persist_worker = PersistWorker::new(persist_tx);
         let persist_events = cx.spawn_in(window, async move |this, cx| {
@@ -265,62 +371,149 @@ impl BookSave {
                 }
             }
         });
+
+        let (host, host_events, capture_status) = match host_link {
+            Some(HostLink { outgoing, incoming }) => {
+                let status = "Select text in another app, then double-tap Left Shift.".into();
+                let events = cx.spawn_in(window, async move |this, cx| {
+                    let mut incoming = incoming;
+                    while let Some(message) = incoming.next().await {
+                        if this
+                            .update_in(cx, |this, window, cx| {
+                                this.receive_host_message(message, window, cx);
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+                if let Err(error) = outgoing.try_send(ClientMessage::Ready) {
+                    cx.spawn(async move |this, cx| {
+                        let _ = this.update(cx, |this, cx| {
+                            this.capture_status = format!("Lost the background host. {error}");
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+                (Some(outgoing), Some(events), status)
+            }
+            None => (
+                None,
+                None,
+                "Global capture is unavailable. The background host is not running.".into(),
+            ),
+        };
+
         let shutdown = cx.on_app_quit(|this, _| {
-            this.capture_worker.stop();
+            if let Some(host) = &this.host {
+                let _ = host.try_send(ClientMessage::UiClosing);
+            }
+            this.persist_session();
             this.persist_worker.shutdown();
             async {}
         });
+
         Self {
             items,
             lowered,
             capture,
             search,
-            composer: Composer::Capture,
+            composer,
             filter: Filter::All,
             path,
             load_failed,
             error,
             status,
-            capture_status: "Starting global capture...".into(),
-            capture_worker,
+            capture_status,
+            host,
             persist_worker,
             persist_next_seq: 0,
             pending: None,
-            deferred_capture: None,
-            _capture_events: capture_events,
+            deferred_capture,
+            capture_cache: initial_text,
+            _host_events: host_events,
             _persist_events: persist_events,
-            _subscriptions: vec![submit, query, shutdown],
+            _subscriptions: vec![submit, drafted, query, shutdown],
         }
     }
 
-    fn receive_capture(
+    fn receive_host_message(
         &mut self,
-        event: CaptureEvent,
+        message: ServerMessage,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.capture_status = match event {
-            CaptureEvent::Ready => "Select text in another app, then double-tap Left Shift.".into(),
-            CaptureEvent::Failed(error) => format!("Global capture failed. {error}"),
-            CaptureEvent::SelectedText(_) if self.load_failed => {
-                "Global capture skipped. Resolve the load error first.".into()
+        match message {
+            ServerMessage::Welcome {
+                tray_available,
+                tray_error,
+                last_capture_error,
+            } => {
+                if !tray_available {
+                    let detail = tray_error
+                        .map(|error| format!(" {error}"))
+                        .unwrap_or_default();
+                    self.error = Some(format!(
+                        "Tray is unavailable. Closing this window will exit Book Save.{detail}"
+                    ));
+                }
+                self.capture_status = match last_capture_error {
+                    Some(error) => format!("Global capture failed. {error}"),
+                    None => "Select text in another app, then double-tap Left Shift.".into(),
+                };
+                cx.notify();
             }
-            CaptureEvent::SelectedText(_) if matches!(self.composer, Composer::Edit { .. }) => {
-                "Global capture skipped. Finish or cancel your edit and resolve any load error first.".into()
+            ServerMessage::Capture { text } => self.receive_capture(text, window, cx),
+            ServerMessage::CaptureFailed { message } => {
+                self.capture_status = format!("Global capture failed. {message}");
+                cx.notify();
             }
-            CaptureEvent::SelectedText(text) if self.pending.is_some() => {
-                self.deferred_capture = Some(text);
-                "Selected text queued until the current save finishes.".into()
-            }
-            CaptureEvent::SelectedText(text) => {
-                self.capture.update(cx, |input, cx| {
-                    input.set_value(text, window, cx);
-                    input.focus(window, cx);
-                });
+            ServerMessage::Open => {
                 window.activate_window();
-                "Selected text is ready. Press Enter or Add to save.".into()
             }
-        };
+            ServerMessage::Quit | ServerMessage::Rejected => cx.quit(),
+            ServerMessage::Error { message } => {
+                self.error = Some(message);
+                cx.notify();
+            }
+            ServerMessage::Pong => {}
+        }
+    }
+
+    fn set_capture_value(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.capture_cache = text.clone();
+        self.capture.update(cx, |input, cx| {
+            input.set_value(text, window, cx);
+            input.focus(window, cx);
+        });
+    }
+
+    fn receive_capture(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.load_failed {
+            self.capture_status = "Global capture skipped. Resolve the load error first.".into();
+            cx.notify();
+            return;
+        }
+        if matches!(self.composer, Composer::Edit { .. }) {
+            self.capture_status =
+                "Global capture skipped. Finish or cancel your edit and resolve any load error first."
+                    .into();
+            cx.notify();
+            return;
+        }
+        if self.pending.is_some() {
+            self.deferred_capture = Some(text);
+            self.capture_status = "Selected text queued until the current save finishes.".into();
+            self.persist_session();
+            cx.notify();
+            return;
+        }
+        self.set_capture_value(text, window, cx);
+        window.activate_window();
+        self.capture_status = "Selected text is ready. Press Enter or Add to save.".into();
+        self.persist_session();
         cx.notify();
     }
 
@@ -335,13 +528,36 @@ impl BookSave {
         let Some(text) = self.deferred_capture.take() else {
             return;
         };
-        self.capture.update(cx, |input, cx| {
-            input.set_value(text, window, cx);
-            input.focus(window, cx);
-        });
+        self.set_capture_value(text, window, cx);
         window.activate_window();
         self.capture_status = "Selected text is ready. Press Enter or Add to save.".into();
+        self.persist_session();
         cx.notify();
+    }
+
+    fn session_snapshot(&self) -> Session {
+        match &self.composer {
+            Composer::Capture => Session {
+                capture_draft: self.capture_cache.clone(),
+                edit_target: None,
+                edit_draft: String::new(),
+                capture_draft_before_edit: String::new(),
+                deferred_capture: self.deferred_capture.clone(),
+            },
+            Composer::Edit { id, capture_draft } => Session {
+                capture_draft: String::new(),
+                edit_target: Some(*id),
+                edit_draft: self.capture_cache.clone(),
+                capture_draft_before_edit: capture_draft.clone(),
+                deferred_capture: self.deferred_capture.clone(),
+            },
+        }
+    }
+
+    fn persist_session(&self) {
+        if let Err(error) = self.session_snapshot().save() {
+            eprintln!("Book Save session save failed: {error}");
+        }
     }
 
     fn base_items(&self) -> Vec<Capture> {
@@ -413,17 +629,11 @@ impl BookSave {
                         self.filter = Filter::All;
                         self.search
                             .update(cx, |input, cx| input.set_value("", window, cx));
-                        self.capture.update(cx, |input, cx| {
-                            input.set_value(String::new(), window, cx);
-                            input.focus(window, cx);
-                        });
+                        self.set_capture_value(String::new(), window, cx);
                     }
                     PendingEffect::SubmitEdit { capture_draft } => {
                         self.composer = Composer::Capture;
-                        self.capture.update(cx, |input, cx| {
-                            input.set_value(capture_draft, window, cx);
-                            input.focus(window, cx);
-                        });
+                        self.set_capture_value(capture_draft, window, cx);
                     }
                     PendingEffect::Toggle => {}
                     PendingEffect::Delete { deleted_id } => {
@@ -433,6 +643,7 @@ impl BookSave {
                         }
                     }
                 }
+                self.persist_session();
                 self.deliver_deferred_capture(window, cx);
                 cx.notify();
             }
@@ -512,14 +723,12 @@ impl BookSave {
         };
         let text = item.text.clone();
         let capture_draft = match std::mem::replace(&mut self.composer, Composer::Capture) {
-            Composer::Capture => self.capture.read(cx).value().to_string(),
+            Composer::Capture => self.capture_cache.clone(),
             Composer::Edit { capture_draft, .. } => capture_draft,
         };
         self.composer = Composer::Edit { id, capture_draft };
-        self.capture.update(cx, |input, cx| {
-            input.set_value(text, window, cx);
-            input.focus(window, cx);
-        });
+        self.set_capture_value(text, window, cx);
+        self.persist_session();
         cx.notify();
     }
 
@@ -530,10 +739,8 @@ impl BookSave {
         if let Composer::Edit { capture_draft, .. } =
             std::mem::replace(&mut self.composer, Composer::Capture)
         {
-            self.capture.update(cx, |input, cx| {
-                input.set_value(capture_draft, window, cx);
-                input.focus(window, cx);
-            });
+            self.set_capture_value(capture_draft, window, cx);
+            self.persist_session();
             cx.notify();
             self.deliver_deferred_capture(window, cx);
         }
@@ -719,21 +926,12 @@ impl Render for BookSave {
                             .child("Book Save"),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("{open} open")),
-                            )
-                            .child(Button::new("quit").ghost().small().label("Quit").on_click(
-                                cx.listener(|_, _, window, _| {
-                                    window.remove_window();
-                                }),
-                            )),
+                        div().flex().items_center().gap_2().child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{open} open")),
+                        ),
                     ),
             )
             .child(
@@ -790,19 +988,34 @@ impl Render for BookSave {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Ctrl+N capture · Ctrl+F search · Closing minimizes, Quit exits"),
+                    .child("Ctrl+N capture · Ctrl+F search · Closing this window keeps Book Save in the tray"),
             )
     }
 }
 
 fn main() {
-    #[cfg(windows)]
-    if lifecycle::handover_to_running_instance() {
-        return;
-    }
-    let background = lifecycle::background_launch_requested();
+    #[cfg(debug_assertions)]
+    let test_instance = std::env::var_os("BOOK_SAVE_TEST_INSTANCE").is_some();
+    #[cfg(debug_assertions)]
+    if test_instance { eprintln!("lifecycle-stage: connect-host-start"); }
+    let (host_link, host_error) = if cfg!(debug_assertions)
+        && std::env::var_os("BOOK_SAVE_TEST_NO_HOST").is_some()
+    {
+        (None, None)
+    } else {
+        match connect_host() {
+            Ok(link) => (Some(link), None),
+            Err(error) => (None, Some(error)),
+        }
+    };
+    #[cfg(debug_assertions)]
+    if test_instance { eprintln!("lifecycle-stage: connect-host-complete"); }
     application().with_assets(AppAssets).run(move |cx| {
+        #[cfg(debug_assertions)]
+        if test_instance { eprintln!("lifecycle-stage: gpui-run-callback"); }
         init(cx);
+        #[cfg(debug_assertions)]
+        if test_instance { eprintln!("lifecycle-stage: init-complete"); }
         Theme::change(ThemeMode::Dark, None, cx);
         cx.bind_keys([
             KeyBinding::new("ctrl-n", FocusCapture, Some("BookSave")),
@@ -816,28 +1029,36 @@ fn main() {
         })
         .detach();
         let bounds = Bounds::centered(None, size(px(520.), px(700.)), cx);
+        #[cfg(debug_assertions)]
+        if test_instance { eprintln!("lifecycle-stage: open-window-start"); }
         open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(420.), px(460.))),
-                show: !background,
-                focus: !background,
+                show: true,
+                focus: true,
                 ..Default::default()
             },
             cx,
             |window, cx| {
+                #[cfg(debug_assertions)]
+                if test_instance { eprintln!("lifecycle-stage: window-builder-enter"); }
                 window.set_window_title("Book Save");
-                window.on_window_should_close(cx, |window, _| {
-                    // Keep the process (and its global capture hook) alive.
-                    // The taskbar button reopens the minimized window, and a
-                    // later launch from the Start menu reveals it as well.
-                    window.minimize_window();
-                    false
+                #[cfg(debug_assertions)]
+                if test_instance { eprintln!("lifecycle-stage: window-title-set"); }
+                window.on_window_should_close(cx, |_, _| {
+                    eprintln!("Book Save window close requested");
+                    true
                 });
-                cx.new(|cx| BookSave::new(window, cx))
+                let view = cx.new(|cx| BookSave::new(window, cx, host_link, host_error));
+                #[cfg(debug_assertions)]
+                if test_instance { eprintln!("lifecycle-stage: view-created"); }
+                view
             },
         )
         .expect("open Book Save window");
+        #[cfg(debug_assertions)]
+        if test_instance { eprintln!("lifecycle-stage: open-window-complete"); }
         cx.activate(true);
     });
 }
@@ -846,9 +1067,9 @@ fn main() {
 mod perf_tests {
     use super::{
         Capture, Filter, PersistRequest, PersistWorker, can_deliver_deferred_capture,
-        copy_legacy_data_if_missing, filter_matches, lifecycle::is_background_arg, lowered_for,
-        write_snapshot,
+        copy_legacy_data_if_missing, filter_matches, lowered_for, write_snapshot,
     };
+    use book_save_host::instance::is_background_arg;
     use std::collections::HashSet;
 
     fn sample_items() -> Vec<Capture> {

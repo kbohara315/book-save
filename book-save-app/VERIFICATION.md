@@ -1,5 +1,15 @@
 # Book Save verification
 
+## Current tray lifecycle, 2026-10-15
+
+The main window hides on **X**. It has no visible taskbar button while hidden. The tray menu has **Open Book Save** and **Exit**. Open restores the same window and keeps its editor state. A selected-text capture shows the window for review. **Exit** quits the app. Shutdown stops the global hook, waits for the save worker to finish, and removes the tray icon. Explorer's `TaskbarCreated` message adds the icon again after Explorer restarts. Tray startup failure shows the main window with an error; closing that window exits the app.
+
+`verify-lifecycle.ps1` launches the debug app with temporary user data and a test-only mutex name. It checks hidden startup, second-launch restore, close-to-hide, tray Open, and tray Exit. It does not touch the clipboard or user saved data. `verify-clipboard.ps1` exercises selected-text copying, clipboard restoration, no-selection behavior, injected key rejection, and image cleanup. Its final result confirmed the original user clipboard bytes, formats, and image content were restored.
+
+Validation on this change: `rustup run stable cargo check --locked --offline`, `rustup run stable cargo test --locked --offline` (10 passed), `rustup run stable cargo build --locked --offline`, `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\verify-lifecycle.ps1` (all five lifecycle checks passed), and `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\verify-clipboard.ps1` (all checks passed). These checks did not exercise a physical Left Shift gesture or the visible GPUI draft field. No install, package, or installed app files were changed.
+
+Entries below record earlier app versions and verification runs.
+
 ## App icon and safe install/uninstall lifecycle, 2026-10-15
 
 The Windows executable now embeds a clean **BS** monogram icon, visible on the exe, taskbar button, and both shortcuts. `assets/make-icon.ps1` renders the monogram with only built-in .NET `System.Drawing` (deep slate-blue rounded tile, white bold Segoe UI letters) into `assets/book-save.ico` as PNG-compressed ICO entries at 16, 32, 48, and 256 px (8,323 bytes). `assets/book-save.rc` plus `build.rs` link it through the Windows SDK resource compiler via the `embed-resource` Windows-only build dependency; no runtime dependency is added. Both shortcuts set `IconLocation` to the installed exe. The release exe grew from 24,208,384 to 24,217,088 bytes (+8,704, about 0.04%); `dumpbin` still reports `2 subsystem (Windows GUI)`.
@@ -234,3 +244,13 @@ rustup run stable cargo build --locked --offline
 ```
 
 The Windows build used the existing Book Save's `.local\cargo` and `.local\rustup` directories and the Visual Studio CMake directory documented above. Build output stayed in this worktree's `book-save-app\target`. No automated tests or runtime clipboard checks were run for this fix. The coordinating parent owns review and runtime verification.
+
+### Tray lifecycle verification
+
+`verify-lifecycle.ps1` launches only test instances. Each debug process gets a unique mutex identity and a temporary `LOCALAPPDATA` folder. The checks do not read or modify the installed app's saved list or the clipboard. The verifier scopes native tray menus to its child PID and clicks relative to the actual menu rectangle because Windows exposes the native popup without UI Automation menu items in this environment.
+
+The run completed with these checks passing: hidden startup with a tray host, repeated-launch handover to the same instance, close-to-hide while the process stays alive, tray Open, unsaved capture-field draft retention across hide/restore, a targeted `TaskbarCreated` message to the test-owned tray window, tray Exit, and both injected startup and runtime tray-failure fallbacks. The “process stays alive” check does not establish that a physical capture gesture works.
+
+Three ten-second hidden-process samples from the unoptimized debug build measured CPU at 0.47%, 0.62%, and 0.00% of one core; average private bytes were 92.6, 86.9, and 86.9 MiB; average working set was 108.1, 107.2, and 107.2 MiB. These are direct Windows process counters with no memory trim. They describe this debug verification process only; they are not release-build measurements.
+
+The draft check uses UI Automation's `ValuePattern` to set and read the actual GPUI capture field. Tray startup failure injection and tray re-add failure injection are debug-only environment switches. The Explorer simulation posts the registered message directly to the test process's tray window; it does not restart Explorer. Physical keyboard capture remains unverified.

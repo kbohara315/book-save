@@ -7,9 +7,9 @@ if (-not $env:LOCALAPPDATA -or -not $env:APPDATA) {
     throw 'Windows did not provide the user data folders.'
 }
 
-$running = Get-Process -Name 'book-save' -ErrorAction SilentlyContinue
+$running = Get-Process -Name 'book-save', 'book-save-ui' -ErrorAction SilentlyContinue
 if ($running) {
-    throw 'Book Save is still running. Open Book Save from the Start menu (or its taskbar button) and select Quit in the app header so pending saves can finish, then run the uninstaller again. The uninstaller will not force-close the app.'
+    throw 'Book Save is still running. Select Exit in the tray menu and wait for Book Save to close, then run the uninstaller again. The uninstaller will not force-close the app.'
 }
 
 $installRoot = Join-Path $env:LOCALAPPDATA 'Programs\Book Save'

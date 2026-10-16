@@ -2,3 +2,5 @@
 /.local/
 /data/
 /dist/
+/verification/target/
+/verification/.local/

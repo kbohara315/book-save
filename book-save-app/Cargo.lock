@@ -661,9 +661,21 @@ dependencies = [
 name = "book-save"
 version = "0.1.0"
 dependencies = [
+ "book-save-host",
  "embed-resource",
  "futures",
  "gpui-kit",
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "book-save-host"
+version = "0.1.0"
+dependencies = [
+ "embed-resource",
+ "futures",
  "serde",
  "serde_json",
  "windows-sys 0.61.2",
